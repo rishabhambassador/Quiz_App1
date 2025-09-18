@@ -4,10 +4,5 @@ bcrypt==4.1.1
 pytz==2025.1 
 gunicorn==21.2.0
 spacy
-matplotlib.pyplot
-
-
-
-
-
-
+sqlite3-binary==0.0.1
+matplotlib==3.9.2
