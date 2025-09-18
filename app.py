@@ -49,7 +49,7 @@ def init_db():
 
 init_db()
 
-# ----------------- Base HTML with placeholder -----------------
+# ----------------- Base HTML -----------------
 base_html = """
 <!DOCTYPE html>
 <html>
@@ -81,7 +81,7 @@ table tr:nth-child(even){background:#f2f2f2;}
 {% endif %}
 </nav>
 <hr>
-{{ content }}
+{{ content|safe }}
 </body>
 </html>
 """
@@ -103,13 +103,13 @@ def teacher_signup():
     key = None
     if request.method == "POST":
         name = request.form["name"]
-        key = secrets.token_hex(4)
+        key = secrets.token_hex(8)  # longer passkey
         hashed = bcrypt.hashpw(key.encode(), bcrypt.gensalt())
         conn = get_db()
         conn.execute("INSERT INTO teachers(name, passkey_hash) VALUES (?,?)", (name, hashed))
         conn.commit()
         conn.close()
-    content = f"""
+    content = """
     <h2>Teacher Sign Up</h2>
     <form method="POST">
         Name: <input type="text" name="name" required><br><br>
