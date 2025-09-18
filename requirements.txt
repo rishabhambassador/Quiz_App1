@@ -1,4 +1,0 @@
-Flask==2.3.4
-Werkzeug==2.3.7
-bcrypt==5.1.1
-pytz==2025.1 
