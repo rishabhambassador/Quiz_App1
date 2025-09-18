@@ -1,4 +1,5 @@
-Flask==2.0/.0
+Flask==2.0.0
 Werkzeug==2.3.7
 bcrypt==5.1.1
 pytz==2025.1 
+
