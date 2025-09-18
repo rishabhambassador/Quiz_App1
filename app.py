@@ -49,7 +49,7 @@ def init_db():
 
 init_db()
 
-# ----------------- Base HTML -----------------
+# ----------------- Base HTML with placeholder -----------------
 base_html = """
 <!DOCTYPE html>
 <html>
@@ -81,7 +81,7 @@ table tr:nth-child(even){background:#f2f2f2;}
 {% endif %}
 </nav>
 <hr>
-{% block content %}{% endblock %}
+{{ content }}
 </body>
 </html>
 """
@@ -90,13 +90,12 @@ table tr:nth-child(even){background:#f2f2f2;}
 
 @app.route("/")
 def index():
-    return render_template_string(base_html + """
-    {% block content %}
+    content = """
     <h1>Welcome to Quiz App</h1>
     <p><a href="/signup/teacher">Teacher Sign Up</a> | <a href="/login/teacher">Teacher Login</a></p>
     <p><a href="/signup/student">Student Sign Up</a> | <a href="/login/student">Student Login</a></p>
-    {% endblock %}
-    """)
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Teacher Signup ---
 @app.route("/signup/teacher", methods=["GET","POST"])
@@ -110,24 +109,21 @@ def teacher_signup():
         conn.execute("INSERT INTO teachers(name, passkey_hash) VALUES (?,?)", (name, hashed))
         conn.commit()
         conn.close()
-    return render_template_string(base_html + """
-    {% block content %}
+    content = f"""
     <h2>Teacher Sign Up</h2>
     <form method="POST">
         Name: <input type="text" name="name" required><br><br>
         <input type="submit" value="Sign Up">
     </form>
-    {% if key %}
-    <p>Your passkey: <strong>{{ key }}</strong></p>
-    <p>Save this to login!</p>
-    {% endif %}
-    {% endblock %}
-    """, key=key)
+    """
+    if key:
+        content += f"<p>Your passkey: <strong>{key}</strong></p><p>Save this to login!</p>"
+    return render_template_string(base_html, content=content)
 
 # --- Teacher Login ---
 @app.route("/login/teacher", methods=["GET","POST"])
 def teacher_login():
-    error = None
+    error = ""
     if request.method=="POST":
         name = request.form["name"]
         passkey = request.form["passkey"]
@@ -139,22 +135,21 @@ def teacher_login():
             return redirect("/teacher")
         else:
             error = "Invalid name or passkey"
-    return render_template_string(base_html + """
-    {% block content %}
+    content = f"""
     <h2>Teacher Login</h2>
     <form method="POST">
         Name: <input type="text" name="name" required><br><br>
         Passkey: <input type="text" name="passkey" required><br><br>
         <input type="submit" value="Login">
     </form>
-    {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-    {% endblock %}
-    """, error=error)
+    <p style="color:red">{error}</p>
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Student Signup ---
 @app.route("/signup/student", methods=["GET","POST"])
 def student_signup():
-    error = None
+    error = ""
     if request.method=="POST":
         student_id = request.form["student_id"]
         name = request.form["name"]
@@ -170,8 +165,7 @@ def student_signup():
             return redirect("/login/student")
         except sqlite3.IntegrityError:
             error = "Student ID already exists."
-    return render_template_string(base_html + """
-    {% block content %}
+    content = f"""
     <h2>Student Sign Up</h2>
     <form method="POST">
         Student ID: <input type="text" name="student_id" required><br>
@@ -181,14 +175,14 @@ def student_signup():
         Class: <input type="text" name="class_name" required><br><br>
         <input type="submit" value="Sign Up">
     </form>
-    {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-    {% endblock %}
-    """, error=error)
+    <p style="color:red">{error}</p>
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Student Login ---
 @app.route("/login/student", methods=["GET","POST"])
 def student_login():
-    error = None
+    error = ""
     if request.method=="POST":
         student_id = request.form["student_id"]
         conn = get_db()
@@ -199,16 +193,15 @@ def student_login():
             return redirect("/student")
         else:
             error = "Student not found"
-    return render_template_string(base_html + """
-    {% block content %}
+    content = f"""
     <h2>Student Login</h2>
     <form method="POST">
         Student ID: <input type="text" name="student_id" required><br><br>
         <input type="submit" value="Login">
     </form>
-    {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-    {% endblock %}
-    """, error=error)
+    <p style="color:red">{error}</p>
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Teacher Dashboard ---
 @app.route("/teacher")
@@ -219,8 +212,9 @@ def teacher_dashboard():
     students = conn.execute("SELECT * FROM students").fetchall()
     questions = conn.execute("SELECT * FROM questions").fetchall()
     conn.close()
-    return render_template_string(base_html + """
-    {% block content %}
+    student_rows = "".join([f"<tr><td>{s['student_id']}</td><td>{s['name']}</td><td>{s['gender']}</td><td>{s['grade']}</td><td>{s['class']}</td></tr>" for s in students])
+    question_rows = "".join([f"<tr><td>{q['grade']}</td><td>{q['class']}</td><td>{q['text']}</td><td>{q['correct']}</td></tr>" for q in questions])
+    content = f"""
     <h2>Teacher Dashboard</h2>
     <h3>Add Question</h3>
     <form method="POST" action="/teacher/question">
@@ -235,19 +229,11 @@ def teacher_dashboard():
         <input type="submit" value="Add Question">
     </form>
     <h3>Students</h3>
-    <table><tr><th>ID</th><th>Name</th><th>Gender</th><th>Grade</th><th>Class</th></tr>
-    {% for s in students %}
-    <tr><td>{{ s['student_id'] }}</td><td>{{ s['name'] }}</td><td>{{ s['gender'] }}</td><td>{{ s['grade'] }}</td><td>{{ s['class'] }}</td></tr>
-    {% endfor %}
-    </table>
+    <table><tr><th>ID</th><th>Name</th><th>Gender</th><th>Grade</th><th>Class</th></tr>{student_rows}</table>
     <h3>Questions</h3>
-    <table><tr><th>Grade</th><th>Class</th><th>Question</th><th>Correct</th></tr>
-    {% for q in questions %}
-    <tr><td>{{ q['grade'] }}</td><td>{{ q['class'] }}</td><td>{{ q['text'] }}</td><td>{{ q['correct'] }}</td></tr>
-    {% endfor %}
-    </table>
-    {% endblock %}
-    """, students=students, questions=questions)
+    <table><tr><th>Grade</th><th>Class</th><th>Question</th><th>Correct</th></tr>{question_rows}</table>
+    """
+    return render_template_string(base_html, content=content)
 
 @app.route("/teacher/question", methods=["POST"])
 def teacher_add_question():
@@ -270,17 +256,13 @@ def student_dashboard():
     conn = get_db()
     questions = conn.execute("SELECT * FROM questions WHERE grade=? AND class=?", (student['grade'], student['class'])).fetchall()
     conn.close()
-    return render_template_string(base_html + """
-    {% block content %}
+    question_rows = "".join([f"<tr><td>{q['text']}</td><td><a href='/attempt/{q['id']}'>Attempt</a></td></tr>" for q in questions])
+    content = f"""
     <h2>Student Dashboard</h2>
     <h3>Available Questions</h3>
-    <table><tr><th>Question</th><th>Action</th></tr>
-    {% for q in questions %}
-    <tr><td>{{ q['text'] }}</td><td><a href="/attempt/{{ q['id'] }}">Attempt</a></td></tr>
-    {% endfor %}
-    </table>
-    {% endblock %}
-    """, questions=questions)
+    <table><tr><th>Question</th><th>Action</th></tr>{question_rows}</table>
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Attempt Question ---
 @app.route("/attempt/<int:q_id>", methods=["GET","POST"])
@@ -298,19 +280,18 @@ def attempt_question(q_id):
         conn.close()
         return redirect("/student")
     conn.close()
-    return render_template_string(base_html + """
-    {% block content %}
+    content = f"""
     <h2>Attempt Question</h2>
     <form method="POST">
-        <p>{{ q['text'] }}</p>
-        <input type="radio" name="answer" value="a" required> {{ q['a'] }}<br>
-        <input type="radio" name="answer" value="b"> {{ q['b'] }}<br>
-        <input type="radio" name="answer" value="c"> {{ q['c'] }}<br>
-        <input type="radio" name="answer" value="d"> {{ q['d'] }}<br><br>
+        <p>{q['text']}</p>
+        <input type="radio" name="answer" value="a" required> {q['a']}<br>
+        <input type="radio" name="answer" value="b"> {q['b']}<br>
+        <input type="radio" name="answer" value="c"> {q['c']}<br>
+        <input type="radio" name="answer" value="d"> {q['d']}<br><br>
         <input type="submit" value="Submit">
     </form>
-    {% endblock %}
-    """, q=q)
+    """
+    return render_template_string(base_html, content=content)
 
 # --- Logout ---
 @app.route("/logout")
