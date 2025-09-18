@@ -1,324 +1,321 @@
-from flask import Flask, request, redirect, session, render_template_string
+from flask import Flask, render_template_string, request, redirect, session
 import sqlite3
 import bcrypt
-import secrets
+import difflib
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)
-DB_PATH = "db.sqlite"
+app.secret_key = "supersecret"
 
-# ----------------- Database -----------------
+# ---------------- DB ----------------
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect("quiz.db")
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS teachers(
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS teachers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
         passkey_hash TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS students(
+    );
+
+    CREATE TABLE IF NOT EXISTS students(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        student_id TEXT UNIQUE,
-        name TEXT,
-        gender TEXT,
-        grade TEXT,
-        class TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS questions(
+        student_id TEXT,
+        grade TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS questions(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        grade TEXT,
-        class TEXT,
-        subject TEXT,
+        teacher_id INTEGER,
         text TEXT,
-        a TEXT, b TEXT, c TEXT, d TEXT,
+        qtype TEXT,
+        subject TEXT,
+        option_a TEXT,
+        option_b TEXT,
+        option_c TEXT,
+        option_d TEXT,
         correct TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS attempts(
+    );
+
+    CREATE TABLE IF NOT EXISTS attempts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id TEXT,
         question_id INTEGER,
         selected TEXT,
         correct INTEGER,
         UNIQUE(student_id, question_id)
-    )''')
+    );
+    """)
     conn.commit()
-    conn.close()
 
 init_db()
 
-# ----------------- Base HTML -----------------
-base_html = """
-<!DOCTYPE html>
+# ---------------- Templates ----------------
+base_template = """
+<!doctype html>
 <html>
 <head>
 <title>Quiz App</title>
 <style>
-body {font-family: Arial; margin:20px; background:#f8f9fa; color:#333;}
-nav {background:#007bff; padding:10px; border-radius:5px;}
-nav a {color:white; text-decoration:none; margin-right:15px; font-weight:bold;}
-nav a:hover{text-decoration:underline;}
-h1,h2,h3{color:#007bff;}
-form {background:#fff; padding:15px; border-radius:5px; max-width:500px; margin-bottom:20px; box-shadow:0px 2px 5px rgba(0,0,0,0.1);}
-input[type=text], select {width:100%; padding:8px; margin:5px 0 15px 0; border-radius:4px; border:1px solid #ccc;}
-input[type=submit]{
-    background:#007bff; 
-    color:white; 
-    padding:14px 28px; 
-    border:none; 
-    border-radius:6px; 
-    cursor:pointer; 
-    font-size:16px; 
-    font-weight:bold;
+body { font-family: Arial; margin: 20px; }
+.nav { background:#007bff; padding:10px; border-radius:10px; }
+.nav a { color:white; font-weight:bold; margin:0 10px; text-decoration:none; }
+.big-btn {
+    font-size:20px; font-weight:bold; padding:12px 24px;
+    margin:10px; background-color:#007BFF; color:white;
+    border:none; border-radius:8px; cursor:pointer; transition:0.3s;
 }
-input[type=submit]:hover{background:#0056b3;}
-table{width:100%; border-collapse:collapse; margin-bottom:20px; background:#fff; border-radius:5px; overflow:hidden; box-shadow:0px 2px 5px rgba(0,0,0,0.1);}
-table th, table td{border:1px solid #ddd; padding:10px; text-align:left;}
-table th{background:#007bff; color:white;}
-table tr:nth-child(even){background:#f2f2f2;}
+.big-btn:hover { background-color:#0056b3; }
 </style>
 </head>
 <body>
-<nav>
-<a href="/">Home</a> |
-<a href="/teacher">Teacher</a> |
-<a href="/student">Student</a> |
-{% if session.get('student') or session.get('teacher') %}
-<a href="/logout">Logout</a>
-{% endif %}
-</nav>
+<div class="nav">
+    <a href="/">Home</a> | 
+    <a href="/signup/teacher">Teacher</a> | 
+    <a href="/signup/student">Student</a>
+</div>
 <hr>
-{{ content }}
+{% block content %}{% endblock %}
 </body>
 </html>
 """
 
-# ----------------- Routes -----------------
-
+# ---------------- Routes ----------------
 @app.route("/")
-def index():
-    content = """
-    <h1>Welcome to Quiz App</h1>
-    <p><a href="/signup/teacher"><button>Teacher Sign Up</button></a> 
-       <a href="/login/teacher"><button>Teacher Login</button></a></p>
-    <p><a href="/signup/student"><button>Student Sign Up</button></a> 
-       <a href="/login/student"><button>Student Login</button></a></p>
-    """
-    return render_template_string(base_html, content=content)
+def home():
+    return render_template_string(
+        base_template + """
+        {% block content %}
+        <h1>Welcome to Quiz App</h1>
+        <a href="/signup/teacher"><button class="big-btn">Teacher Sign Up</button></a>
+        <a href="/login/teacher"><button class="big-btn">Teacher Login</button></a>
+        <a href="/signup/student"><button class="big-btn">Student Sign Up</button></a>
+        <a href="/login/student"><button class="big-btn">Student Login</button></a>
+        {% endblock %}
+        """
+    )
 
-# --- Teacher Signup ---
+# ---------- Teacher signup/login ----------
 @app.route("/signup/teacher", methods=["GET","POST"])
-def teacher_signup():
-    key = None
-    if request.method == "POST":
-        name = request.form["name"]
-        key = secrets.token_hex(4)
-        hashed = bcrypt.hashpw(key.encode(), bcrypt.gensalt()).decode("utf-8")
-        conn = get_db()
+def signup_teacher():
+    if request.method=="POST":
+        name=request.form["name"]
+        passkey=request.form["passkey"]
+        hashed=bcrypt.hashpw(passkey.encode(), bcrypt.gensalt()).decode()
+        conn=get_db()
         try:
-            conn.execute("INSERT INTO teachers(name, passkey_hash) VALUES (?,?)", (name, hashed))
+            conn.execute("INSERT INTO teachers(name,passkey_hash) VALUES (?,?)",(name,hashed))
             conn.commit()
-        except sqlite3.IntegrityError:
-            conn.close()
-            return "Teacher name already exists."
-        conn.close()
-    content = f"""
+            return redirect("/login/teacher")
+        except:
+            return "Teacher already exists."
+    return render_template_string(base_template+"""
+    {% block content %}
     <h2>Teacher Sign Up</h2>
-    <form method="POST">
-        Name: <input type="text" name="name" required><br><br>
-        <input type="submit" value="Sign Up">
+    <form method="post">
+        Name:<input name="name"><br>
+        Passkey:<input type="password" name="passkey"><br>
+        <button type="submit">Sign Up</button>
     </form>
-    """
-    if key:
-        content += f"<p>Your passkey: <strong>{key}</strong></p><p>Save this to login!</p>"
-    return render_template_string(base_html, content=content)
+    {% endblock %}
+    """)
 
-# --- Teacher Login ---
 @app.route("/login/teacher", methods=["GET","POST"])
-def teacher_login():
-    error = ""
+def login_teacher():
     if request.method=="POST":
-        name = request.form["name"]
-        passkey = request.form["passkey"]
-        conn = get_db()
-        teacher = conn.execute("SELECT * FROM teachers WHERE name=?", (name,)).fetchone()
-        conn.close()
-        if teacher and bcrypt.checkpw(passkey.encode(), teacher["passkey_hash"].encode("utf-8")):
-            session["teacher"] = {"id": teacher["id"], "name": teacher["name"]}
-            return redirect("/teacher")
-        else:
-            error = "Invalid name or passkey"
-    content = f"""
+        name=request.form["name"]
+        passkey=request.form["passkey"]
+        conn=get_db()
+        t=conn.execute("SELECT * FROM teachers WHERE name=?",(name,)).fetchone()
+        if t and bcrypt.checkpw(passkey.encode(), t["passkey_hash"].encode()):
+            session["teacher_id"]=t["id"]
+            return redirect("/teacher/dashboard")
+        return "Invalid login"
+    return render_template_string(base_template+"""
+    {% block content %}
     <h2>Teacher Login</h2>
-    <form method="POST">
-        Name: <input type="text" name="name" required><br><br>
-        Passkey: <input type="password" name="passkey" required><br><br>
-        <input type="submit" value="Login">
+    <form method="post">
+        Name:<input name="name"><br>
+        Passkey:<input type="password" name="passkey"><br>
+        <button type="submit">Login</button>
     </form>
-    <p style="color:red">{error}</p>
-    """
-    return render_template_string(base_html, content=content)
+    {% endblock %}
+    """)
 
-# --- Student Signup ---
+# ---------- Student signup/login ----------
 @app.route("/signup/student", methods=["GET","POST"])
-def student_signup():
-    error = ""
+def signup_student():
     if request.method=="POST":
-        student_id = request.form["student_id"]
-        name = request.form["name"]
-        gender = request.form["gender"]
-        grade = request.form["grade"]
-        class_name = request.form["class_name"]
-        conn = get_db()
-        try:
-            conn.execute("INSERT INTO students(student_id,name,gender,grade,class) VALUES (?,?,?,?,?)",
-                         (student_id,name,gender,grade,class_name))
-            conn.commit()
-            conn.close()
-            return redirect("/login/student")
-        except sqlite3.IntegrityError:
-            error = "Student ID already exists."
-    content = f"""
+        student_id=request.form["student_id"]
+        grade=request.form["grade"]
+        conn=get_db()
+        conn.execute("INSERT INTO students(student_id, grade) VALUES (?,?)",(student_id,grade))
+        conn.commit()
+        return redirect("/login/student")
+    return render_template_string(base_template+"""
+    {% block content %}
     <h2>Student Sign Up</h2>
-    <form method="POST">
-        Student ID: <input type="text" name="student_id" required><br>
-        Name: <input type="text" name="name" required><br>
-        Gender: <select name="gender"><option>Male</option><option>Female</option></select><br>
-        Grade: <input type="text" name="grade" required><br>
-        Class: <input type="text" name="class_name" required><br><br>
-        <input type="submit" value="Sign Up">
+    <form method="post">
+        Student ID:<input name="student_id"><br>
+        Grade:<input name="grade"><br>
+        <button type="submit">Sign Up</button>
     </form>
-    <p style="color:red">{error}</p>
-    """
-    return render_template_string(base_html, content=content)
+    {% endblock %}
+    """)
 
-# --- Student Login ---
 @app.route("/login/student", methods=["GET","POST"])
-def student_login():
-    error = ""
+def login_student():
     if request.method=="POST":
-        student_id = request.form["student_id"]
-        conn = get_db()
-        student = conn.execute("SELECT * FROM students WHERE student_id=?", (student_id,)).fetchone()
-        conn.close()
-        if student:
-            session["student"] = dict(student)
-            return redirect("/student")
-        else:
-            error = "Student not found"
-    content = f"""
+        student_id=request.form["student_id"]
+        conn=get_db()
+        s=conn.execute("SELECT * FROM students WHERE student_id=?",(student_id,)).fetchone()
+        if s:
+            session["student_id"]=s["student_id"]
+            return redirect("/student/dashboard")
+        return "Not found"
+    return render_template_string(base_template+"""
+    {% block content %}
     <h2>Student Login</h2>
-    <form method="POST">
-        Student ID: <input type="text" name="student_id" required><br><br>
-        <input type="submit" value="Login">
+    <form method="post">
+        Student ID:<input name="student_id"><br>
+        <button type="submit">Login</button>
     </form>
-    <p style="color:red">{error}</p>
-    """
-    return render_template_string(base_html, content=content)
+    {% endblock %}
+    """)
 
-# --- Teacher Dashboard ---
-@app.route("/teacher")
+# ---------- Teacher dashboard ----------
+@app.route("/teacher/dashboard")
 def teacher_dashboard():
-    if "teacher" not in session:
+    if "teacher_id" not in session:
         return redirect("/login/teacher")
-    conn = get_db()
-    students = conn.execute("SELECT * FROM students").fetchall()
-    questions = conn.execute("SELECT * FROM questions").fetchall()
-    conn.close()
-    student_rows = "".join([f"<tr><td>{s['student_id']}</td><td>{s['name']}</td><td>{s['gender']}</td><td>{s['grade']}</td><td>{s['class']}</td></tr>" for s in students])
-    question_rows = "".join([f"<tr><td>{q['grade']}</td><td>{q['class']}</td><td>{q['subject']}</td><td>{q['text']}</td><td>{q['correct']}</td></tr>" for q in questions])
-    content = f"""
+    conn=get_db()
+    data=conn.execute("""
+        SELECT s.grade, SUM(a.correct) as correct_count, COUNT(a.id) as total
+        FROM attempts a
+        JOIN students s ON a.student_id = s.student_id
+        GROUP BY s.grade
+    """).fetchall()
+    grades={row["grade"]: (row["correct_count"]/row["total"]*100) for row in data} if data else {}
+    return render_template_string(base_template+"""
+    {% block content %}
     <h2>Teacher Dashboard</h2>
-    <h3>Add Question</h3>
-    <form method="POST" action="/teacher/question">
-        Grade: <input type="text" name="grade" required><br>
-        Class: <input type="text" name="class_name" required><br>
-        Subject: <input type="text" name="subject" required><br>
-        Question: <input type="text" name="text" required><br>
-        Option A: <input type="text" name="a" required><br>
-        Option B: <input type="text" name="b" required><br>
-        Option C: <input type="text" name="c" required><br>
-        Option D: <input type="text" name="d" required><br>
-        Correct Option (a/b/c/d): <input type="text" name="correct" required><br><br>
-        <input type="submit" value="Add Question">
-    </form>
-    <h3>Students</h3>
-    <table><tr><th>ID</th><th>Name</th><th>Gender</th><th>Grade</th><th>Class</th></tr>{student_rows}</table>
-    <h3>Questions</h3>
-    <table><tr><th>Grade</th><th>Class</th><th>Subject</th><th>Question</th><th>Correct</th></tr>{question_rows}</table>
-    """
-    return render_template_string(base_html, content=content)
+    <a href="/teacher/add_question"><button>Add Question</button></a>
+    <h3>Performance by Grade</h3>
+    <canvas id="gradeChart"></canvas>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+    const ctx=document.getElementById('gradeChart');
+    new Chart(ctx,{
+        type:'bar',
+        data:{
+            labels: {{ grades.keys()|list|tojson }},
+            datasets:[{
+                label:'Avg Score (%)',
+                data: {{ grades.values()|list|tojson }},
+                backgroundColor:'rgba(54,162,235,0.6)'
+            }]
+        },
+        options:{scales:{y:{beginAtZero:true,max:100}}}
+    });
+    </script>
+    {% endblock %}
+    """, grades=grades)
 
-@app.route("/teacher/question", methods=["POST"])
-def teacher_add_question():
-    if "teacher" not in session:
-        return redirect("/login/teacher")
-    data = request.form
-    conn = get_db()
-    conn.execute("INSERT INTO questions(grade,class,subject,text,a,b,c,d,correct) VALUES (?,?,?,?,?,?,?,?,?)",
-                 (data['grade'], data['class_name'], data['subject'], data['text'], data['a'], data['b'], data['c'], data['d'], data['correct']))
-    conn.commit()
-    conn.close()
-    return redirect("/teacher")
-
-# --- Student Dashboard ---
-@app.route("/student")
-def student_dashboard():
-    if "student" not in session:
-        return redirect("/login/student")
-    student = session["student"]
-    conn = get_db()
-    questions = conn.execute("SELECT * FROM questions WHERE grade=? AND class=?", (student['grade'], student['class'])).fetchall()
-    conn.close()
-    question_rows = "".join([f"<tr><td>{q['subject']}</td><td>{q['text']}</td><td><a href='/attempt/{q['id']}'>Attempt</a></td></tr>" for q in questions])
-    content = f"""
-    <h2>Student Dashboard</h2>
-    <h3>Available Questions</h3>
-    <table><tr><th>Subject</th><th>Question</th><th>Action</th></tr>{question_rows}</table>
-    """
-    return render_template_string(base_html, content=content)
-
-# --- Attempt Question ---
-@app.route("/attempt/<int:q_id>", methods=["GET","POST"])
-def attempt_question(q_id):
-    if "student" not in session:
-        return redirect("/login/student")
-    conn = get_db()
-    q = conn.execute("SELECT * FROM questions WHERE id=?", (q_id,)).fetchone()
+# ---------- Add question ----------
+@app.route("/teacher/add_question", methods=["GET","POST"])
+def add_question():
+    if "teacher_id" not in session: return redirect("/login/teacher")
     if request.method=="POST":
-        selected = request.form['answer']
-        correct = 1 if selected==q['correct'] else 0
+        text=request.form["text"]
+        qtype=request.form["qtype"]
+        subject=request.form["subject"]
+        a,b,c,d,correct=None,None,None,None,None
+        if qtype=="mcq":
+            a=request.form["a"]; b=request.form["b"]; c=request.form["c"]; d=request.form["d"]; correct=request.form["correct"]
+        else:
+            correct=request.form["correct_text"]
+        conn=get_db()
+        conn.execute("INSERT INTO questions(teacher_id,text,qtype,subject,option_a,option_b,option_c,option_d,correct) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (session["teacher_id"],text,qtype,subject,a,b,c,d,correct))
+        conn.commit()
+        return redirect("/teacher/dashboard")
+    return render_template_string(base_template+"""
+    {% block content %}
+    <h2>Add Question</h2>
+    <form method="post">
+        Question:<input name="text"><br>
+        Subject:<input name="subject"><br>
+        Type:<select name="qtype" id="qtype" onchange="toggle()">
+            <option value="mcq">MCQ</option>
+            <option value="desc">Descriptive</option>
+        </select><br>
+        <div id="mcq">
+            A:<input name="a"><br>
+            B:<input name="b"><br>
+            C:<input name="c"><br>
+            D:<input name="d"><br>
+            Correct:<input name="correct"><br>
+        </div>
+        <div id="desc" style="display:none;">
+            Correct Answer:<input name="correct_text"><br>
+        </div>
+        <button type="submit">Save</button>
+    </form>
+    <script>
+    function toggle(){
+        let v=document.getElementById("qtype").value;
+        document.getElementById("mcq").style.display=(v=="mcq")?"block":"none";
+        document.getElementById("desc").style.display=(v=="desc")?"block":"none";
+    }
+    </script>
+    {% endblock %}
+    """)
+
+# ---------- Student dashboard ----------
+@app.route("/student/dashboard", methods=["GET","POST"])
+def student_dashboard():
+    if "student_id" not in session: return redirect("/login/student")
+    conn=get_db()
+    questions=conn.execute("SELECT * FROM questions").fetchall()
+    if request.method=="POST":
+        qid=request.form["qid"]; ans=request.form["answer"]
+        q=conn.execute("SELECT * FROM questions WHERE id=?",(qid,)).fetchone()
+        correct=0
+        if q["qtype"]=="mcq":
+            if ans==q["correct"]: correct=1
+        else:
+            ratio=difflib.SequenceMatcher(None,ans.lower(),q["correct"].lower()).ratio()
+            if ratio>0.7: correct=1
         try:
             conn.execute("INSERT INTO attempts(student_id,question_id,selected,correct) VALUES (?,?,?,?)",
-                         (session['student']['student_id'], q_id, selected, correct))
+                         (session["student_id"],qid,ans,correct))
             conn.commit()
-        except sqlite3.IntegrityError:
-            pass  # already attempted
-        conn.close()
-        return redirect("/student")
-    conn.close()
-    content = f"""
-    <h2>Attempt Question</h2>
-    <form method="POST">
-        <p><strong>{q['subject']}:</strong> {q['text']}</p>
-        <input type="radio" name="answer" value="a" required> {q['a']}<br>
-        <input type="radio" name="answer" value="b"> {q['b']}<br>
-        <input type="radio" name="answer" value="c"> {q['c']}<br>
-        <input type="radio" name="answer" value="d"> {q['d']}<br><br>
-        <input type="submit" value="Submit">
+        except:
+            pass
+        return redirect("/student/dashboard")
+    return render_template_string(base_template+"""
+    {% block content %}
+    <h2>Student Dashboard</h2>
+    {% for q in questions %}
+    <form method="post">
+        <p>{{ q.text }} ({{ q.subject }})</p>
+        {% if q.qtype=="mcq" %}
+            <input type="radio" name="answer" value="a">{{ q.option_a }}<br>
+            <input type="radio" name="answer" value="b">{{ q.option_b }}<br>
+            <input type="radio" name="answer" value="c">{{ q.option_c }}<br>
+            <input type="radio" name="answer" value="d">{{ q.option_d }}<br>
+        {% else %}
+            <textarea name="answer"></textarea><br>
+        {% endif %}
+        <input type="hidden" name="qid" value="{{ q.id }}">
+        <button type="submit">Submit</button>
     </form>
-    """
-    return render_template_string(base_html, content=content)
-
-# --- Logout ---
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/")
+    {% endfor %}
+    {% endblock %}
+    """, questions=questions)
 
 if __name__=="__main__":
     app.run(debug=True)
