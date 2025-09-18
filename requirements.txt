@@ -3,6 +3,9 @@ Werkzeug==2.2.0
 bcrypt==4.1.1
 pytz==2025.1 
 gunicorn==21.2.0
-spacy
 matplotlib==3.9.2
+spacy==3.7.4
+matplotlib==3.9.2
+en-core-web-sm==3.7.1
+
 
