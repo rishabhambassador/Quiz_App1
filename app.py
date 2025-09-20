@@ -95,7 +95,6 @@ def similarity_ratio(a, b):
 def home():
     return render_page(f"""
         <div style="text-align:center;">
-            <img src="/static/logo.png" alt="Ambassador School" style="max-width:200px;">
             <h1 style="color:#2c3e50;">Ambassador Quiz App</h1>
             <h3 style="color:#7f8c8d;">Inspire • Inquire • Innovate</h3>
             <div style="margin-top:30px;">
