@@ -247,18 +247,32 @@ def quiz():
             <a href='/'><button class='btn'>Back to Dashboard</button></a>
         """)
 
-    q_html = "<h2>Quiz - Ambassador Quiz App</h2><form method='post'>"
+    # HTML with improved MCQ formatting
+    q_html = """
+    <h2>Quiz - Ambassador Quiz App</h2>
+    <form method='post'>
+        <style>
+            .question { margin: 20px 0; padding: 15px; background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: left; }
+            .options { margin-left: 20px; }
+            .options label { display: block; margin: 5px 0; }
+        </style>
+    """
     for q in questions:
-        q_html += f"<p><b>{q['text']}</b></p>"
+        q_html += f"<div class='question'><p><b>{q['text']}</b></p>"
         if (q["qtype"] or "").lower() == "mcq":
+            q_html += "<div class='options'>"
             for opt in ["a", "b", "c", "d"]:
                 val = q[f"option_{opt}"]
                 if val:
-                    q_html += f"<input type='radio' name='{q['id']}' value='{val}'> {val}<br>"
+                    q_html += f"<label><input type='radio' name='{q['id']}' value='{val}'> {val}</label>"
+            q_html += "</div>"
         else:
-            q_html += f"<input name='{q['id']}' placeholder='Your Answer'><br>"
+            q_html += f"<input name='{q['id']}' placeholder='Your Answer' style='width:95%; padding:8px;'><br>"
+        q_html += "</div>"
     q_html += "<button type='submit' class='btn'>Submit</button></form>"
+
     return render_page(q_html)
+
 
 # ---------- Add Question ----------
 @app.route("/teacher/add_question", methods=["GET", "POST"])
@@ -418,4 +432,5 @@ def logout():
 if __name__ == "__main__":
     print("🚀 Ambassador Quiz App running at http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
