@@ -5,7 +5,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 import base64
-import csv
 import difflib
 
 # ReportLab for PDF
@@ -70,7 +69,7 @@ def render_page(content):
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Quiz App</title>
+        <title>Ambassador Quiz App</title>
         <style>
             body {{
                 font-family: Arial, sans-serif;
@@ -121,7 +120,7 @@ def similarity_ratio(ans, correct):
 @app.route("/")
 def home():
     return render_page("""
-        <h1>Welcome to Quiz App</h1>
+        <h1>Welcome to Ambassador Quiz App</h1>
         <a href='/signup/student'><button class='btn'>Student Sign Up</button></a>
         <a href='/login/student'><button class='btn'>Student Login</button></a>
         <a href='/login/teacher'><button class='btn'>Teacher Login</button></a>
@@ -146,7 +145,7 @@ def signup_student():
         except:
             return render_page("<p>⚠️ Username already exists!</p><a href='/signup/student'><button class='btn'>Back</button></a>")
     return render_page("""
-        <h2>Student Signup</h2>
+        <h2>Student Signup - Ambassador Quiz App</h2>
         <form method='post'>
             <input name='username' placeholder='Username' required><br>
             <input type='password' name='password' placeholder='Password' required><br>
@@ -183,7 +182,7 @@ def login_student():
                 <a href='/login/student'><button class='btn'>Back to Login</button></a>
             """)
     return render_page("""
-        <h2>Student Login</h2>
+        <h2>Student Login - Ambassador Quiz App</h2>
         <form method='post'>
             <input name='username' placeholder='Username'><br>
             <input type='password' name='password' placeholder='Password'><br>
@@ -207,7 +206,7 @@ def login_teacher():
                 <a href='/login/teacher'><button class='btn'>Back to Login</button></a>
             """)
     return render_page("""
-        <h2>Teacher Login</h2>
+        <h2>Teacher Login - Ambassador Quiz App</h2>
         <form method='post'>
             <input name='username' placeholder='Username'><br>
             <input type='password' name='password' placeholder='Passkey'><br>
@@ -248,7 +247,7 @@ def quiz():
             <a href='/'><button class='btn'>Back to Dashboard</button></a>
         """)
 
-    q_html = "<h2>Quiz</h2><form method='post'>"
+    q_html = "<h2>Quiz - Ambassador Quiz App</h2><form method='post'>"
     for q in questions:
         q_html += f"<p><b>{q['text']}</b></p>"
         if (q["qtype"] or "").lower() == "mcq":
@@ -289,7 +288,7 @@ def add_question():
             <a href='/teacher/dashboard'><button class='btn'>Back to Dashboard</button></a>
         """)
     return render_page("""
-        <h2>Add Question</h2>
+        <h2>Add Question - Ambassador Quiz App</h2>
         <form method='post'>
             <input name='text' placeholder='Question Text' required><br>
             <input name='correct' placeholder='Correct Answer' required><br>
@@ -327,7 +326,7 @@ def teacher_dashboard():
     plt.bar(grades, scores, color="skyblue")
     plt.ylim(0, 100)
     plt.ylabel("Avg Score (%)")
-    plt.title("Performance by Grade")
+    plt.title("Ambassador Quiz App - Performance by Grade")
 
     img = io.BytesIO()
     plt.savefig(img, format="png")
@@ -336,7 +335,7 @@ def teacher_dashboard():
     plt.close()
 
     return render_page(f"""
-        <h2>📊 Teacher Dashboard</h2>
+        <h2>📊 Teacher Dashboard - Ambassador Quiz App</h2>
         <img src='data:image/png;base64,{graph_url}'/>
         <br>
         <a href='/teacher/add_question'><button class='btn'>➕ Add Question</button></a>
@@ -366,7 +365,7 @@ def download_data():
     elements = []
     styles = getSampleStyleSheet()
 
-    elements.append(Paragraph("📊 Student Performance Report", styles["Title"]))
+    elements.append(Paragraph("📊 Ambassador Quiz App - Student Performance Report", styles["Title"]))
     elements.append(Spacer(1, 20))
 
     # Group data by grade
@@ -407,7 +406,7 @@ def download_data():
 
     return Response(buffer,
                     mimetype="application/pdf",
-                    headers={"Content-Disposition": "attachment;filename=student_report.pdf"})
+                    headers={"Content-Disposition": "attachment;filename=ambassador_quiz_report.pdf"})
 
 # ---------- Logout ----------
 @app.route("/logout")
@@ -417,5 +416,6 @@ def logout():
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    print("🚀 Server running at http://127.0.0.1:5000")
+    print("🚀 Ambassador Quiz App running at http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
