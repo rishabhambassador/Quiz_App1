@@ -1,16 +1,23 @@
-from flask import Flask, request, redirect, session, render_template_string
+from flask import Flask, request, redirect, session, render_template_string, Response
 import sqlite3
-import difflib
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 import base64
+import csv
+import difflib
+
+# ReportLab for PDF
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
 app = Flask(__name__)
 app.secret_key = "supersecret"
 
-# ✅ Teacher passkeys
+# Teacher passkeys
 TEACHER_PASSKEYS = {
     "teacher1": "math123",
     "teacher2": "science456",
@@ -30,8 +37,8 @@ def init_db():
                         username TEXT UNIQUE,
                         password TEXT,
                         grade TEXT,
-                        class TEXT,
-                        gender TEXT
+                        gender TEXT,
+                        class_name TEXT
                     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS questions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +64,7 @@ def init_db():
 
 init_db()
 
-# ---------- Helper: Base Layout ----------
+# ---------- Helper ----------
 def render_page(content):
     base = f"""
     <!DOCTYPE html>
@@ -68,31 +75,34 @@ def render_page(content):
             body {{
                 font-family: Arial, sans-serif;
                 background: #f8f9fa;
-                margin: 0; padding: 0;
+                margin: 0;
+                padding: 0;
             }}
             .container {{
-                max-width: 700px;
-                margin: 40px auto;
+                width: 80%;
+                margin: auto;
                 padding: 20px;
-                background: #fff;
-                border-radius: 10px;
-                box-shadow: 0 2px 6px rgba(0,0,0,0.2);
-            }}
-            h1, h2, h3 {{ text-align: center; color: #333; }}
-            form {{ margin-top: 15px; }}
-            input, select, textarea {{
-                width: 100%; padding: 8px; margin: 6px 0;
-                border: 1px solid #ccc; border-radius: 5px;
+                text-align: center;
             }}
             .btn {{
-                background: #007bff; color: white;
-                padding: 10px 15px; border: none;
-                border-radius: 5px; cursor: pointer;
-                margin-top: 10px;
+                background: #4CAF50;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                margin: 5px;
+                border-radius: 5px;
+                cursor: pointer;
             }}
-            .btn:hover {{ background: #0056b3; }}
-            .nav {{ text-align: center; margin-top: 20px; }}
-            .nav a {{ margin: 0 10px; }}
+            .btn:hover {{
+                background: #45a049;
+            }}
+            input, select {{
+                padding: 8px;
+                margin: 5px;
+                width: 60%;
+                border-radius: 5px;
+                border: 1px solid #ccc;
+            }}
         </style>
     </head>
     <body>
@@ -104,7 +114,6 @@ def render_page(content):
     """
     return render_template_string(base)
 
-# ---------- Similarity ----------
 def similarity_ratio(ans, correct):
     return difflib.SequenceMatcher(None, ans.lower().strip(), correct.lower().strip()).ratio()
 
@@ -113,11 +122,9 @@ def similarity_ratio(ans, correct):
 def home():
     return render_page("""
         <h1>Welcome to Quiz App</h1>
-        <div class='nav'>
-            <a href='/signup/student'><button class='btn'>Student Sign Up</button></a>
-            <a href='/login/student'><button class='btn'>Student Login</button></a>
-            <a href='/login/teacher'><button class='btn'>Teacher Login</button></a>
-        </div>
+        <a href='/signup/student'><button class='btn'>Student Sign Up</button></a>
+        <a href='/login/student'><button class='btn'>Student Login</button></a>
+        <a href='/login/teacher'><button class='btn'>Teacher Login</button></a>
     """)
 
 # ---------- Student Signup ----------
@@ -127,31 +134,31 @@ def signup_student():
         username = request.form["username"]
         password = request.form["password"]
         grade = request.form["grade"]
-        class_ = request.form["class"]
         gender = request.form["gender"]
+        class_name = request.form["class_name"]
         try:
             conn = get_db()
-            conn.execute("INSERT INTO students(username, password, grade, class, gender) VALUES (?, ?, ?, ?, ?)",
-                         (username, password, grade, class_, gender))
+            conn.execute("INSERT INTO students(username, password, grade, gender, class_name) VALUES (?, ?, ?, ?, ?)",
+                         (username, password, grade, gender, class_name))
             conn.commit()
             conn.close()
             return redirect("/login/student")
         except:
-            return render_page("<h3>⚠ Username already exists!</h3>")
+            return render_page("<p>⚠️ Username already exists!</p><a href='/signup/student'><button class='btn'>Back</button></a>")
     return render_page("""
         <h2>Student Signup</h2>
         <form method='post'>
-            Username: <input name='username' required><br>
-            Password: <input type='password' name='password' required><br>
-            Grade: <input name='grade' required><br>
-            Class: <input name='class' required><br>
-            Gender: 
+            <input name='username' placeholder='Username' required><br>
+            <input type='password' name='password' placeholder='Password' required><br>
+            <input name='grade' placeholder='Grade' required><br>
             <select name='gender' required>
+                <option value=''>Select Gender</option>
                 <option value='Male'>Male</option>
                 <option value='Female'>Female</option>
                 <option value='Other'>Other</option>
             </select><br>
-            <button class='btn' type='submit'>Sign Up</button>
+            <input name='class_name' placeholder='Class' required><br>
+            <button type='submit' class='btn'>Sign Up</button>
         </form>
     """)
 
@@ -171,13 +178,16 @@ def login_student():
             session["grade"] = student["grade"]
             return redirect("/quiz")
         else:
-            return render_page("<h3>❌ Invalid credentials!</h3>")
+            return render_page("""
+                <p>❌ Invalid student credentials!</p>
+                <a href='/login/student'><button class='btn'>Back to Login</button></a>
+            """)
     return render_page("""
         <h2>Student Login</h2>
         <form method='post'>
-            Username: <input name='username'><br>
-            Password: <input type='password' name='password'><br>
-            <button class='btn' type='submit'>Login</button>
+            <input name='username' placeholder='Username'><br>
+            <input type='password' name='password' placeholder='Password'><br>
+            <button type='submit' class='btn'>Login</button>
         </form>
     """)
 
@@ -192,13 +202,16 @@ def login_teacher():
             session["teacher"] = username
             return redirect("/teacher/dashboard")
         else:
-            return render_page("<h3>❌ Invalid teacher credentials!</h3>")
+            return render_page("""
+                <p>❌ Invalid teacher credentials!</p>
+                <a href='/login/teacher'><button class='btn'>Back to Login</button></a>
+            """)
     return render_page("""
         <h2>Teacher Login</h2>
         <form method='post'>
-            Username: <input name='username'><br>
-            Passkey: <input type='password' name='password'><br>
-            <button class='btn' type='submit'>Login</button>
+            <input name='username' placeholder='Username'><br>
+            <input type='password' name='password' placeholder='Passkey'><br>
+            <button type='submit' class='btn'>Login</button>
         </form>
     """)
 
@@ -210,47 +223,42 @@ def quiz():
 
     grade = session.get("grade", "")
     conn = get_db()
-    questions = conn.execute(
-        "SELECT * FROM questions WHERE grade=? OR grade='' OR grade IS NULL",
-        (grade,)
-    ).fetchall()
+    questions = conn.execute("SELECT * FROM questions WHERE grade=?", (grade,)).fetchall()
     conn.close()
 
     if request.method == "POST":
         student_id = session["student_id"]
-        recorded = 0
         for q in questions:
-            qid = str(q["id"])
-            ans = request.form.get(qid)
+            ans = request.form.get(str(q["id"]))
             if ans is None:
                 continue
             if (q["qtype"] or "").lower() == "mcq":
-                correct_flag = 1 if ans.strip() == (q["correct"] or "").strip() else 0
+                correct = 1 if ans.strip() == (q["correct"] or "").strip() else 0
             else:
                 sim = similarity_ratio(ans, q["correct"] or "")
-                correct_flag = 1 if sim >= 0.75 else 0
+                correct = 1 if sim > 0.75 else 0
             conn = get_db()
-            conn.execute(
-                "INSERT INTO attempts(student_id, question_id, student_answer, correct) VALUES (?, ?, ?, ?)",
-                (student_id, q["id"], ans, correct_flag)
-            )
+            conn.execute("INSERT INTO attempts(student_id, question_id, student_answer, correct) VALUES (?, ?, ?, ?)",
+                         (student_id, q["id"], ans, correct))
             conn.commit()
             conn.close()
-            recorded += 1
-        return render_page(f"<h3 class='center'>✅ Quiz submitted! ({recorded} answers recorded)</h3>")
+        return render_page("""
+            <h3>✅ Quiz submitted!</h3>
+            <a href='/quiz'><button class='btn'>Back to Quiz</button></a>
+            <a href='/'><button class='btn'>Back to Dashboard</button></a>
+        """)
 
-    # Render quiz form
-    q_html = "<h2 class='center'>Quiz</h2><form method='post'>"
+    q_html = "<h2>Quiz</h2><form method='post'>"
     for q in questions:
-        q_html += f"<p><strong>{q['text']}</strong></p>"
+        q_html += f"<p><b>{q['text']}</b></p>"
         if (q["qtype"] or "").lower() == "mcq":
             for opt in ["a", "b", "c", "d"]:
                 val = q[f"option_{opt}"]
                 if val:
-                    q_html += f"<label><input type='radio' name='{q['id']}' value='{val}'> {val}</label><br>"
+                    q_html += f"<input type='radio' name='{q['id']}' value='{val}'> {val}<br>"
         else:
-            q_html += f"<textarea name='{q['id']}' placeholder='Your answer' rows='3' style='width:100%;'></textarea><br>"
-    q_html += "<div style='margin-top:12px;'><button class='btn' type='submit'>Submit Quiz</button></div></form>"
+            q_html += f"<input name='{q['id']}' placeholder='Your Answer'><br>"
+    q_html += "<button type='submit' class='btn'>Submit</button></form>"
     return render_page(q_html)
 
 # ---------- Add Question ----------
@@ -269,39 +277,34 @@ def add_question():
         b = request.form.get("option_b")
         c = request.form.get("option_c")
         d = request.form.get("option_d")
-
         conn = get_db()
-        conn.execute(
-            """INSERT INTO questions(text, correct, option_a, option_b, option_c, option_d, subject, qtype, grade)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (text, correct, a, b, c, d, subject, qtype, grade),
-        )
+        conn.execute("""INSERT INTO questions(text, correct, option_a, option_b, option_c, option_d, subject, qtype, grade)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     (text, correct, a, b, c, d, subject, qtype, grade))
         conn.commit()
         conn.close()
-
         return render_page("""
-            <h2>✅ Question Added!</h2>
-            <div class='nav'>
-                <a href='/teacher/add_question'><button class='btn'>Add Another Question</button></a>
-                <a href='/teacher/dashboard'><button class='btn'>Back to Dashboard</button></a>
-            </div>
+            <p>✅ Question added!</p>
+            <a href='/teacher/add_question'><button class='btn'>Add Another</button></a>
+            <a href='/teacher/dashboard'><button class='btn'>Back to Dashboard</button></a>
         """)
-
     return render_page("""
         <h2>Add Question</h2>
         <form method='post'>
-            Question Text: <input name='text' required><br>
-            Correct Answer: <input name='correct' required><br>
-            Subject: <input name='subject' required><br>
-            Type (mcq/short): <input name='qtype' required><br>
-            Grade: <input name='grade' required><br>
-            Option A: <input name='option_a'><br>
-            Option B: <input name='option_b'><br>
-            Option C: <input name='option_c'><br>
-            Option D: <input name='option_d'><br><br>
-            <button class='btn' type='submit'>Add</button>
+            <input name='text' placeholder='Question Text' required><br>
+            <input name='correct' placeholder='Correct Answer' required><br>
+            <input name='subject' placeholder='Subject' required><br>
+            <select name='qtype' required>
+                <option value='mcq'>MCQ</option>
+                <option value='short'>Subjective</option>
+            </select><br>
+            <input name='grade' placeholder='Grade' required><br>
+            <input name='option_a' placeholder='Option A'><br>
+            <input name='option_b' placeholder='Option B'><br>
+            <input name='option_c' placeholder='Option C'><br>
+            <input name='option_d' placeholder='Option D'><br>
+            <button type='submit' class='btn'>Add Question</button>
         </form>
-        <div class='nav'><a href='/teacher/dashboard'><button class='btn'>⬅ Back to Dashboard</button></a></div>
     """)
 
 # ---------- Teacher Dashboard ----------
@@ -333,29 +336,78 @@ def teacher_dashboard():
     plt.close()
 
     return render_page(f"""
-        <h2>Teacher Dashboard</h2>
-        <div class='nav'>
-            <a href='/teacher/add_question'><button class='btn'>Add Question</button></a>
-            <a href='/reset_db'><button class='btn'>⚠ Wipe All Data</button></a>
-            <a href='/logout'><button class='btn'>Logout</button></a>
-        </div>
-        <h3>Performance by Grade</h3>
+        <h2>📊 Teacher Dashboard</h2>
         <img src='data:image/png;base64,{graph_url}'/>
+        <br>
+        <a href='/teacher/add_question'><button class='btn'>➕ Add Question</button></a>
+        <a href='/teacher/download_data'><button class='btn'>⬇️ Download Report (PDF)</button></a>
+        <a href='/logout'><button class='btn'>Logout</button></a>
     """)
 
-# ---------- Reset DB (Teacher only) ----------
-@app.route("/reset_db")
-def reset_db():
+# ---------- Teacher PDF Report ----------
+@app.route("/teacher/download_data")
+def download_data():
     if "teacher" not in session:
         return redirect("/login/teacher")
 
     conn = get_db()
-    conn.execute("DELETE FROM students")
-    conn.execute("DELETE FROM questions")
-    conn.execute("DELETE FROM attempts")
-    conn.commit()
+    data = conn.execute("""
+        SELECT s.username, s.grade, s.gender, s.class_name,
+               q.subject, q.text AS question, a.student_answer, a.correct
+        FROM attempts a
+        JOIN students s ON a.student_id = s.id
+        JOIN questions q ON a.question_id = q.id
+        ORDER BY s.grade, s.username
+    """).fetchall()
     conn.close()
-    return render_page("<h2>✅ All data wiped!</h2><div class='nav'><a href='/teacher/dashboard'><button class='btn'>Back</button></a></div>")
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    elements.append(Paragraph("📊 Student Performance Report", styles["Title"]))
+    elements.append(Spacer(1, 20))
+
+    # Group data by grade
+    grade_groups = {}
+    for row in data:
+        grade = row["grade"]
+        if grade not in grade_groups:
+            grade_groups[grade] = []
+        grade_groups[grade].append(row)
+
+    for grade, rows in grade_groups.items():
+        elements.append(Paragraph(f"Grade {grade}", styles["Heading2"]))
+        elements.append(Spacer(1, 12))
+
+        table_data = [["Username", "Gender", "Class", "Subject", "Question", "Answer", "Correct"]]
+        for row in rows:
+            table_data.append([
+                row["username"], row["gender"], row["class_name"],
+                row["subject"], row["question"], row["student_answer"],
+                "✅" if row["correct"] else "❌"
+            ])
+
+        table = Table(table_data, repeatRows=1, colWidths=[70, 50, 50, 70, 150, 100, 50])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey])
+        ]))
+
+        elements.append(table)
+        elements.append(Spacer(1, 24))
+
+    doc.build(elements)
+    buffer.seek(0)
+
+    return Response(buffer,
+                    mimetype="application/pdf",
+                    headers={"Content-Disposition": "attachment;filename=student_report.pdf"})
 
 # ---------- Logout ----------
 @app.route("/logout")
@@ -365,8 +417,5 @@ def logout():
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    host = "0.0.0.0"
-    port = 5000
-    print(f"✅ Server running at http://{host}:{port}")
-    app.run(host=host, port=port, debug=False)
-
+    print("🚀 Server running at http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)
