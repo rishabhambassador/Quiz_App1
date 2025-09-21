@@ -1,5 +1,6 @@
-flask==3.0.3
-gunicorn==23.0.0
+Flask==3.0.3
 plotly==5.24.1
-xhtml2pdf==0.2.15
 pandas==2.2.3
+xhtml2pdf==0.2.15
+Werkzeug==2.3.7
+gunicorn==23.0.0
