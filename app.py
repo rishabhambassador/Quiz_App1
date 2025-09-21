@@ -1,24 +1,21 @@
 # app.py
 from flask import Flask, request, redirect, session, render_template_string, send_file, url_for
 import sqlite3
-import io
 import re
+import io
 import plotly.graph_objects as go
 from xhtml2pdf import pisa
+from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = "supersecret"
 
-# ---------- Teacher credentials ----------
-TEACHER_PASSKEYS = {
-    "teacher1": "math123",
-    "teacher2": "science456",
-    "admin": "supersecret"
-}
-
-# ---------- Database helpers & init ----------
 DB_PATH = "quiz.db"
 
+# teacher passkeys
+TEACHER_PASSKEYS = {"teacher1": "math123", "teacher2": "science456", "admin": "supersecret"}
+
+# ----------------- DB helpers & init -----------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -29,116 +26,100 @@ def init_db():
     # students
     conn.execute("""
     CREATE TABLE IF NOT EXISTS students (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       username TEXT UNIQUE,
-       password TEXT,
-       grade TEXT,
-       gender TEXT,
-       class_section TEXT
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE,
+      password TEXT,
+      grade TEXT,
+      gender TEXT,
+      class_section TEXT
     )""")
-    # quizzes (store an optional passage text)
+    # quizzes
     conn.execute("""
     CREATE TABLE IF NOT EXISTS quizzes (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       title TEXT,
-       subject TEXT,
-       grade TEXT,
-       passage TEXT,
-       timer INTEGER DEFAULT 0
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT,
+      subject TEXT,
+      grade TEXT,
+      timer_seconds INTEGER DEFAULT 0
     )""")
-    # questions belonging to quizzes
+    # passages (each passage belongs to a quiz)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS passages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      quiz_id INTEGER,
+      title TEXT,
+      text_content TEXT,
+      image_url TEXT
+    )""")
+    # questions (each question belongs to a passage)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS questions (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       quiz_id INTEGER,
-       text TEXT,
-       correct TEXT,
-       option_a TEXT,
-       option_b TEXT,
-       option_c TEXT,
-       option_d TEXT,
-       qtype TEXT,
-       image TEXT
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      passage_id INTEGER,
+      text TEXT,
+      correct TEXT,
+      option_a TEXT,
+      option_b TEXT,
+      option_c TEXT,
+      option_d TEXT,
+      qtype TEXT,
+      image_url TEXT
     )""")
     # attempts
     conn.execute("""
     CREATE TABLE IF NOT EXISTS attempts (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       student_id INTEGER,
-       quiz_id INTEGER,
-       question_id INTEGER,
-       student_answer TEXT,
-       correct INTEGER
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      student_id INTEGER,
+      quiz_id INTEGER,
+      passage_id INTEGER,
+      question_id INTEGER,
+      student_answer TEXT,
+      correct INTEGER,
+      created_at TEXT
     )""")
     conn.commit()
     conn.close()
 
 init_db()
 
-# ---------- Helpers ----------
-def render_page(content):
-    # Use .format(content=...) to avoid f-string brace issues in CSS
+# ----------------- Utilities -----------------
+def render_page(content, title="Ambassador Quiz App"):
+    # Use .format(content=...) to avoid f-string braces issues
     base = """
-    <!DOCTYPE html>
+    <!doctype html>
     <html>
-    <head>
-      <meta charset="utf-8">
-      <title>Ambassador Quiz App</title>
-      <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-      <style>
-        body {{
-          font-family: Arial, sans-serif;
-          margin: 20px;
-          background-color: #f9f9f9;
-        }}
-        h1,h2,h3 {{ color: #2c3e50; }}
-        .btn {{
-          padding: 8px 15px;
-          margin: 5px;
-          background: #3498db;
-          color: white;
-          border: none;
-          border-radius: 5px;
-          cursor: pointer;
-          text-decoration: none;
-        }}
-        .btn:hover {{ background: #2980b9; }}
-        .card {{
-          background: white;
-          padding: 15px;
-          margin: 10px 0;
-          border-radius: 8px;
-          box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }}
-        input, select, textarea {{
-          margin: 5px 0;
-          padding: 6px;
-          width: 100%;
-          max-width: 600px;
-          border-radius:6px;
-          border:1px solid #ddd;
-        }}
-        .row {{ display:flex; gap:12px; }}
-        .col {{ flex:1; }}
-        img.responsive {{ max-width:100%; height:auto; border-radius:6px; margin-top:8px; }}
-        .muted {{ color:#6b7280; font-size:14px; }}
-        @media(max-width:900px){{ .row {{ flex-direction: column; }} }}
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        {content}
-      </div>
-    </body>
+      <head>
+        <meta charset="utf-8"/>
+        <title>{title}</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+          body {{ font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:18px; }}
+          .card {{ max-width:1100px; margin:18px auto; background:#fff; padding:18px; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,0.06) }}
+          h1,h2 {{ text-align:center; margin:6px 0 }}
+          .btn {{ display:inline-block; padding:8px 14px; border-radius:6px; background:#2b8cff; color:#fff; text-decoration:none; border:none; cursor:pointer }}
+          .btn:hover {{ background:#1f6fd6 }}
+          .muted {{ color:#6b7280; font-size:14px }}
+          input, textarea, select {{ width:100%; padding:8px; margin:6px 0; border-radius:6px; border:1px solid #ddd; box-sizing:border-box }}
+          .row {{ display:flex; gap:12px }}
+          .col {{ flex:1 }}
+          img.responsive {{ max-width:100%; height:auto; border-radius:6px; margin-top:8px }}
+          @media(max-width:900px){{ .row {{ flex-direction: column; }} }}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          {content}
+        </div>
+      </body>
     </html>
-    """.format(content=content)
-    return render_template_string(base)
+    """
+    return render_template_string(base.format(content=content, title=title))
 
 def normalize_words(text):
     return re.findall(r"\w+", (text or "").lower())
 
 def check_similarity(ans, correct, threshold=0.6):
-    """Simple keyword overlap similarity (dependency-free)."""
+    "Keyword overlap: matches / len(correct_words) >= threshold -> correct"
     if not ans or not correct:
         return 0
     a = normalize_words(ans)
@@ -149,41 +130,39 @@ def check_similarity(ans, correct, threshold=0.6):
     ratio = matches / len(c)
     return 1 if ratio >= threshold else 0
 
-def make_plot(labels, scores, title, div_id):
-    fig = go.Figure([go.Bar(x=list(labels), y=list(scores), marker_color="skyblue")])
-    fig.update_layout(title=title, yaxis=dict(title="Avg (%)", range=[0,100]), margin=dict(l=20,r=20,t=40,b=30), height=300)
-    return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id)
-
 def html_to_pdf_bytes(source_html):
     out = io.BytesIO()
     pisa.CreatePDF(src=source_html, dest=out)
     out.seek(0)
     return out
 
-# ---------- Routes ----------
+def make_plot(labels, values, title, div_id):
+    fig = go.Figure([go.Bar(x=list(labels), y=list(values), marker_color="skyblue")])
+    fig.update_layout(title=title, yaxis=dict(title="Avg (%)", range=[0,100]), margin=dict(l=20,r=20,t=40,b=30), height=300)
+    return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id)
+
+# ----------------- Public routes -----------------
 @app.route("/")
 def home():
-    # show quizzes (all grades) on homepage
     conn = get_db()
     quizzes = conn.execute("SELECT * FROM quizzes ORDER BY id DESC").fetchall()
     conn.close()
-    html = "<h1>Ambassador Quiz App</h1>"
-    html += "<p class='muted' style='text-align:center'>Inspire · Inquire · Innovate</p>"
+    html = "<h1>Ambassador Quiz App</h1><p class='muted' style='text-align:center'>Inspire · Inquire · Innovate</p>"
     html += "<div style='text-align:center;margin-bottom:12px'>"
     html += "<a class='btn' href='/signup/student'>Student Sign Up</a> "
     html += "<a class='btn' href='/login/student'>Student Login</a> "
     html += "<a class='btn' href='/login/teacher'>Teacher Login</a></div>"
-    html += "<h3>Available Quizzes</h3>"
+    html += "<h3>Quizzes</h3>"
     if quizzes:
         for q in quizzes:
             html += f"<div style='padding:10px;border:1px solid #eee;margin:8px 0;border-radius:6px;display:flex;justify-content:space-between;align-items:center'>"
-            html += f"<div><strong>{q['title']}</strong> <div class='muted'>{q['subject']} • Grade {q['grade']}</div></div>"
-            html += f"<div><a class='btn' href='/quiz/{q['id']}'>Take Quiz</a></div></div>"
+            html += f"<div><strong>{q['title']}</strong><div class='muted'>{q['subject']} • Grade {q['grade']}</div></div>"
+            html += f"<div><a class='btn' href='/quiz/start/{q['id']}'>Take Quiz</a></div></div>"
     else:
-        html += "<p class='muted'>No quizzes created yet.</p>"
+        html += "<p class='muted'>No quizzes yet</p>"
     return render_page(html)
 
-# ---------- Student signup/login ----------
+# ----------------- Student signup/login -----------------
 @app.route("/signup/student", methods=["GET","POST"])
 def signup_student():
     if request.method == "POST":
@@ -193,7 +172,7 @@ def signup_student():
         gender = request.form.get("gender","").strip()
         class_section = request.form.get("class_section","").strip()
         if not username or not password:
-            return render_page("<p>Username & password required</p><a href='/signup/student' class='btn'>Back</a>")
+            return render_page("<p>Username and password required</p><a class='btn' href='/signup/student'>Back</a>")
         try:
             conn = get_db()
             conn.execute("INSERT INTO students(username,password,grade,gender,class_section) VALUES (?,?,?,?,?)",
@@ -201,16 +180,16 @@ def signup_student():
             conn.commit(); conn.close()
             return redirect("/login/student")
         except sqlite3.IntegrityError:
-            return render_page("<p>Username already exists!</p><a href='/signup/student' class='btn'>Back</a>")
+            return render_page("<p>Username already exists</p><a class='btn' href='/signup/student'>Back</a>")
     form = """
-      <h2>Student Signup</h2>
+      <h2>Student Sign Up</h2>
       <form method="post">
         <input name="username" placeholder="Username" required>
-        <input name="password" placeholder="Password" required type="password">
+        <input name="password" type="password" placeholder="Password" required>
         <input name="grade" placeholder="Grade (e.g. 7)">
-        <input name="class_section" placeholder="Class / Section (optional)">
+        <input name="class_section" placeholder="Class (optional)">
         <select name="gender"><option value="">Select Gender</option><option>Male</option><option>Female</option><option>Other</option></select>
-        <button class="btn" type="submit">Sign Up</button>
+        <button class='btn' type="submit">Sign Up</button>
       </form>
     """
     return render_page(form)
@@ -221,23 +200,22 @@ def login_student():
         username = request.form.get("username","").strip()
         password = request.form.get("password","").strip()
         conn = get_db()
-        student = conn.execute("SELECT * FROM students WHERE username=? AND password=?", (username,password)).fetchone()
+        s = conn.execute("SELECT * FROM students WHERE username=? AND password=?", (username,password)).fetchone()
         conn.close()
-        if student:
-            session["student_id"] = student["id"]
-            session["grade"] = student["grade"]
+        if s:
+            session["student_id"] = s["id"]; session["grade"] = s["grade"]
             return redirect("/quiz/select")
-        return render_page("<p>Invalid credentials!</p><a href='/login/student' class='btn'>Back</a>")
+        return render_page("<p>Invalid credentials</p><a class='btn' href='/login/student'>Back</a>")
     return render_page("""
       <h2>Student Login</h2>
       <form method="post">
         <input name="username" placeholder="Username" required>
-        <input name="password" placeholder="Password" type="password" required>
+        <input name="password" type="password" placeholder="Password" required>
         <button class='btn' type="submit">Login</button>
       </form>
     """)
 
-# ---------- Teacher login ----------
+# ----------------- Teacher login -----------------
 @app.route("/login/teacher", methods=["GET","POST"])
 def login_teacher():
     if request.method == "POST":
@@ -246,17 +224,17 @@ def login_teacher():
         if username in TEACHER_PASSKEYS and TEACHER_PASSKEYS[username] == password:
             session["teacher"] = username
             return redirect("/teacher/dashboard")
-        return render_page("<p>Invalid teacher credentials</p><a href='/login/teacher' class='btn'>Back</a>")
+        return render_page("<p>Invalid teacher credentials</p><a class='btn' href='/login/teacher'>Back</a>")
     return render_page("""
       <h2>Teacher Login</h2>
       <form method="post">
         <input name="username" placeholder="Teacher username" required>
-        <input name="password" placeholder="Passkey" type="password" required>
+        <input name="password" type="password" placeholder="Passkey" required>
         <button class='btn' type="submit">Login</button>
       </form>
     """)
 
-# ---------- Teacher create quiz ----------
+# ----------------- Teacher: create quiz, add passages and questions -----------------
 @app.route("/teacher/create_quiz", methods=["GET","POST"])
 def teacher_create_quiz():
     if "teacher" not in session:
@@ -265,72 +243,99 @@ def teacher_create_quiz():
         title = request.form.get("title","").strip()
         subject = request.form.get("subject","").strip()
         grade = request.form.get("grade","").strip()
-        passage = request.form.get("passage","").strip()
-        # safe parse timer
-        timer_raw = request.form.get("timer","").strip()
+        timer_raw = request.form.get("timer_seconds","").strip()
         try:
             timer = int(timer_raw) if timer_raw else 0
         except ValueError:
             timer = 0
         conn = get_db()
-        cur = conn.execute("INSERT INTO quizzes(title,subject,grade,passage,timer) VALUES (?,?,?,?,?)",
-                           (title,subject,grade,passage,timer))
+        cur = conn.execute("INSERT INTO quizzes(title,subject,grade,timer_seconds) VALUES (?,?,?,?)",
+                           (title,subject,grade,timer))
         conn.commit(); quiz_id = cur.lastrowid; conn.close()
-        return redirect(f"/teacher/add_question/{quiz_id}")
-    form = """
+        return redirect(url_for("teacher_add_passage", quiz_id=quiz_id))
+    return render_page("""
       <h2>Create Quiz</h2>
       <form method="post">
         <input name="title" placeholder="Quiz title" required>
         <input name="subject" placeholder="Subject" required>
         <input name="grade" placeholder="Grade (e.g. 7)" required>
-        <label>Passage (optional)</label><textarea name="passage" rows="5" placeholder="Paste passage text (optional)"></textarea>
-        <input name="timer" placeholder="Timer in seconds (optional)">
+        <input name="timer_seconds" placeholder="Timer per passage (seconds, optional)">
         <button class='btn' type="submit">Create Quiz</button>
       </form>
-    """
-    return render_page(form)
+    """)
 
-# ---------- Teacher add question (supports image URL) ----------
-@app.route("/teacher/add_question/<int:quiz_id>", methods=["GET","POST"])
-def teacher_add_question(quiz_id):
+@app.route("/teacher/add_passage/<int:quiz_id>", methods=["GET","POST"])
+def teacher_add_passage(quiz_id):
     if "teacher" not in session:
         return redirect("/login/teacher")
     conn = get_db()
     quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
     conn.close()
     if not quiz:
-        return render_page("<p>Quiz not found</p><a class='btn' href='/teacher/dashboard'>Dashboard</a>")
+        return render_page("<p>Quiz not found</p><a class='btn' href='/teacher/dashboard'>Back</a>")
+    if request.method == "POST":
+        title = request.form.get("title","").strip()
+        text_content = request.form.get("text_content","").strip()
+        image_url = request.form.get("image_url","").strip() or None
+        conn = get_db()
+        cur = conn.execute("INSERT INTO passages(quiz_id,title,text_content,image_url) VALUES (?,?,?,?)",
+                           (quiz_id,title,text_content,image_url))
+        conn.commit(); pid = cur.lastrowid; conn.close()
+        return redirect(url_for("teacher_add_question", passage_id=pid))
+    form = f"""
+      <h2>Add Passage to Quiz: {quiz['title']}</h2>
+      <form method="post">
+        <input name="title" placeholder="Passage title (optional)">
+        <label>Passage text</label><textarea name="text_content" rows="6" placeholder="Paste passage text (optional)"></textarea>
+        <input name="image_url" placeholder="Image URL for passage (optional)">
+        <button class='btn' type="submit">Add Passage</button>
+      </form>
+      <p class='muted'>After adding passage you'll be redirected to add questions for it.</p>
+      <a class='btn' href='/teacher/dashboard'>Dashboard</a>
+    """
+    return render_page(form)
+
+@app.route("/teacher/add_question/<int:passage_id>", methods=["GET","POST"])
+def teacher_add_question(passage_id):
+    if "teacher" not in session:
+        return redirect("/login/teacher")
+    conn = get_db()
+    passage = conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+    conn.close()
+    if not passage:
+        return render_page("<p>Passage not found</p><a class='btn' href='/teacher/dashboard'>Back</a>")
     if request.method == "POST":
         text = request.form.get("text","").strip()
         correct = request.form.get("correct","").strip()
         qtype = request.form.get("qtype","mcq").strip()
-        a = request.form.get("option_a") or None
-        b = request.form.get("option_b") or None
-        c = request.form.get("option_c") or None
-        d = request.form.get("option_d") or None
-        image = request.form.get("image_url") or None
+        option_a = request.form.get("option_a") or None
+        option_b = request.form.get("option_b") or None
+        option_c = request.form.get("option_c") or None
+        option_d = request.form.get("option_d") or None
+        image_url = request.form.get("image_url") or None
         conn = get_db()
-        conn.execute("""INSERT INTO questions(quiz_id,text,correct,option_a,option_b,option_c,option_d,qtype,image)
-                        VALUES (?,?,?,?,?,?,?,?,?)""", (quiz_id, text, correct, a, b, c, d, qtype, image))
+        conn.execute("""INSERT INTO questions(passage_id,text,correct,option_a,option_b,option_c,option_d,qtype,image_url)
+                        VALUES (?,?,?,?,?,?,?,?,?)""", (passage_id,text,correct,option_a,option_b,option_c,option_d,qtype,image_url))
         conn.commit(); conn.close()
-        return render_page(f"<p>Question added to quiz '{quiz['title']}'</p>"
-                           f"<a class='btn' href='/teacher/add_question/{quiz_id}'>Add Another</a> "
-                           f"<a class='btn' href='/teacher/dashboard'>Dashboard</a>")
+        return render_page(f"<p>Question added to passage '{passage['title'] or passage['id']}'</p>"
+                           f"<a class='btn' href='/teacher/add_question/{passage_id}'>Add Another</a> "
+                           f"<a class='btn' href='/teacher/view_quiz/{passage['quiz_id']}'>Back to Quiz</a>")
     form = f"""
-      <h2>Add Question to: {quiz['title']}</h2>
+      <h2>Add Question (Passage: {passage['title'] or passage['id']})</h2>
       <form method="post">
         <input name="text" placeholder="Question text" required>
-        <input name="correct" placeholder="Correct answer (exact text for MCQ; keywords for subjective)" required>
+        <input name="correct" placeholder="Correct answer (for MCQ enter option text; for subjective enter keywords)" required>
         <select name="qtype"><option value="mcq">MCQ</option><option value="subjective">Subjective</option></select>
         <div style="display:flex;gap:8px"><input name="option_a" placeholder="Option A"><input name="option_b" placeholder="Option B"></div>
         <div style="display:flex;gap:8px"><input name="option_c" placeholder="Option C"><input name="option_d" placeholder="Option D"></div>
-        <input name="image_url" placeholder="Image URL (optional)">
+        <input name="image_url" placeholder="Question image URL (optional)">
         <button class='btn' type="submit">Add Question</button>
       </form>
+      <a class='btn' href='/teacher/dashboard'>Dashboard</a>
     """
     return render_page(form)
 
-# ---------- Student: select quiz for their grade ----------
+# ----------------- Student: select quiz -----------------
 @app.route("/quiz/select")
 def student_select_quiz():
     if "student_id" not in session:
@@ -340,65 +345,91 @@ def student_select_quiz():
     quizzes = conn.execute("SELECT * FROM quizzes WHERE grade=?", (grade,)).fetchall()
     conn.close()
     if not quizzes:
-        return render_page("<h3>No quizzes for your grade yet</h3><a class='btn' href='/'>Home</a>")
+        return render_page("<p>No quizzes for your grade yet</p><a class='btn' href='/'>Home</a>")
     html = "<h2>Select Quiz</h2>"
     for q in quizzes:
         html += f"<div class='card'><strong>{q['title']}</strong><div class='muted'>{q['subject']}</div>"
-        html += f"<a class='btn' href='/quiz/{q['id']}'>Start</a></div>"
+        html += f"<a class='btn' href='/quiz/start/{q['id']}'>Start</a></div>"
     return render_page(html)
 
-# ---------- Student attempt quiz (one page with timer auto-submit) ----------
-@app.route("/quiz/<int:quiz_id>", methods=["GET","POST"])
-def attempt_quiz(quiz_id):
+# ----------------- Student: start quiz -> redirects to first passage -----------------
+@app.route("/quiz/start/<int:quiz_id>")
+def quiz_start(quiz_id):
+    # start at passage 0 for this quiz
+    return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=0))
+
+# ----------------- Student: passage-by-passage quiz flow -----------------
+@app.route("/quiz/<int:quiz_id>/passage/<int:p_index>", methods=["GET","POST"])
+def quiz_passage(quiz_id, p_index):
     if "student_id" not in session:
         return redirect("/login/student")
     conn = get_db()
     quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-    questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
+    passages = conn.execute("SELECT * FROM passages WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
     conn.close()
     if not quiz:
         return render_page("<p>Quiz not found</p><a class='btn' href='/'>Home</a>")
+    if p_index < 0 or p_index >= len(passages):
+        return render_page("<p>Invalid passage</p><a class='btn' href='/'>Home</a>")
+    passage = passages[p_index]
+    # load questions for this passage
+    conn = get_db()
+    questions = conn.execute("SELECT * FROM questions WHERE passage_id=? ORDER BY id", (passage["id"],)).fetchall()
+    conn.close()
 
+    # Handle submission for this passage: record attempts for all questions in this passage, then go to next passage
     if request.method == "POST":
-        conn = get_db()
         student_id = session["student_id"]
+        now = datetime.utcnow().isoformat()
+        conn = get_db()
         for q in questions:
-            ans = (request.form.get(str(q["id"])) or "").strip()
+            ans = (request.form.get(f"q_{q['id']}") or "").strip()
             if (q["qtype"] or "").lower() == "mcq":
-                correct = 1 if ans.strip().lower() == (q["correct"] or "").strip().lower() else 0
+                correct_flag = 1 if ans.lower() == (q["correct"] or "").lower() else 0
             else:
-                correct = check_similarity(ans, q["correct"])
-            conn.execute("INSERT INTO attempts(student_id,quiz_id,question_id,student_answer,correct) VALUES (?,?,?,?,?)",
-                         (student_id, quiz_id, q["id"], ans, correct))
+                correct_flag = check_similarity(ans, q["correct"])
+            conn.execute("""INSERT INTO attempts(student_id,quiz_id,passage_id,question_id,student_answer,correct,created_at)
+                            VALUES (?,?,?,?,?,?,?)""", (student_id, quiz_id, passage["id"], q["id"], ans, correct_flag, now))
         conn.commit(); conn.close()
-        return render_page("<h3>Quiz submitted — thank you!</h3><a class='btn' href='/'>Home</a>")
+        # next passage
+        next_index = p_index + 1
+        if next_index >= len(passages):
+            return render_page("<h3>Quiz completed — well done!</h3><a class='btn' href='/'>Home</a>")
+        return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=next_index))
 
-    # Build quiz page: show passage (if any) then questions
+    # render passage and its questions
     page = f"<h2>{quiz['title']} — {quiz['subject']} (Grade {quiz['grade']})</h2>"
-    if quiz.get("passage"):
-        page += f"<div class='card'><strong>Passage</strong><div style='white-space:pre-wrap'>{quiz['passage']}</div></div>"
+    page += f"<h3>Passage {p_index+1} of {len(passages)}: {passage['title'] or ''}</h3>"
+    if passage["text_content"]:
+        page += f"<div class='card'><div style='white-space:pre-wrap'>{passage['text_content']}</div></div>"
+    if passage["image_url"]:
+        page += f"<div class='card'><img class='responsive' src='{passage['image_url']}' alt='passage image'></div>"
     page += "<form method='post'>"
     for q in questions:
         page += "<div class='card'>"
         page += f"<p><strong>Q{q['id']}.</strong> {q['text']}</p>"
-        if q.get("image"):
-            page += f"<img class='responsive' src='{q['image']}' alt='question image'><br>"
+        if q["image_url"]:
+            page += f"<img class='responsive' src='{q['image_url']}' alt='question image'><br>"
         if (q["qtype"] or "").lower() == "mcq":
-            for opt in ["a","b","c","d"]:
+            for opt in ("a","b","c","d"):
                 val = q.get(f"option_{opt}")
                 if val:
-                    page += f"<label><input type='radio' name='{q['id']}' value='{val}'> {val}</label><br>"
+                    page += f"<label><input type='radio' name='q_{q['id']}' value='{val}'> {val}</label><br>"
         else:
-            page += f"<textarea name='{q['id']}' rows='4' style='width:100%'></textarea>"
+            page += f"<textarea name='q_{q['id']}' rows='4' style='width:100%'></textarea>"
         page += "</div>"
-    page += "<button class='btn' type='submit'>Submit Quiz</button></form>"
+    page += "<div style='display:flex;gap:8px'><button class='btn' type='submit'>Submit Passage</button>"
+    # allow going back to previous passage to review (optional)
+    if p_index > 0:
+        back_url = url_for("quiz_passage", quiz_id=quiz_id, p_index=p_index-1)
+        page += f"<a class='btn' href='{back_url}'>Previous Passage</a>"
+    page += "</div></form>"
 
-    # Timer block (if zero or missing, no timer shown)
-    timer_seconds = int(quiz.get("timer") or 0)
+    # Timer: quiz.timer_seconds applied per passage if >0
+    timer_seconds = int(quiz.get("timer_seconds") or 0)
     if timer_seconds > 0:
-        # timer div first, script after
         page += "<div id='timer' class='muted'></div>"
-        # script uses DOMContentLoaded to ensure element present
+        # JS timer auto-submits the form when time runs out
         page += f"""
         <script>
         document.addEventListener('DOMContentLoaded', function() {{
@@ -412,9 +443,8 @@ def attempt_quiz(quiz_id):
             }}
             if (timeLeft <= 0) {{
               clearInterval(interval);
-              // auto-submit the form
               var form = document.forms[0];
-              if (form) {{ form.submit(); }}
+              if (form) form.submit();
             }}
           }}, 1000);
         }});
@@ -423,25 +453,22 @@ def attempt_quiz(quiz_id):
 
     return render_page(page)
 
-# ---------- Teacher dashboard (charts + links) ----------
+# ----------------- Teacher dashboard, management, reports -----------------
 @app.route("/teacher/dashboard")
 def teacher_dashboard():
     if "teacher" not in session:
         return redirect("/login/teacher")
     conn = get_db()
-    # grade-level averages
     grade_rows = conn.execute("""
       SELECT s.grade as label, AVG(a.correct)*100.0 as pct
       FROM attempts a JOIN students s ON a.student_id = s.id
       GROUP BY s.grade
     """).fetchall()
-    # subject-level averages (subject is stored in quizzes)
     subject_rows = conn.execute("""
       SELECT qz.subject as label, AVG(a.correct)*100.0 as pct
       FROM attempts a JOIN quizzes qz ON a.quiz_id = qz.id
       GROUP BY qz.subject
     """).fetchall()
-    # quiz-level averages
     quiz_rows = conn.execute("""
       SELECT qz.title as label, AVG(a.correct)*100.0 as pct
       FROM attempts a JOIN quizzes qz ON a.quiz_id = qz.id
@@ -481,7 +508,6 @@ def teacher_dashboard():
     html += "</div>"
     return render_page(html)
 
-# ---------- Teacher list & view quizzes ----------
 @app.route("/teacher/list_quizzes")
 def teacher_list_quizzes():
     if "teacher" not in session:
@@ -491,9 +517,10 @@ def teacher_list_quizzes():
     conn.close()
     html = "<h2>Quizzes</h2>"
     for q in quizzes:
-        html += f"<div style='padding:8px;border:1px solid #eee;margin:8px 0;border-radius:6px;display:flex;justify-content:space-between'>"
+        html += f"<div class='card'><div style='display:flex;justify-content:space-between;align-items:center'>"
         html += f"<div><strong>{q['title']}</strong><div class='muted'>{q['subject']} • Grade {q['grade']}</div></div>"
-        html += f"<div><a class='btn' href='/teacher/add_question/{q['id']}'>Add Question</a> <a class='btn' href='/teacher/view_quiz/{q['id']}'>View</a></div></div>"
+        html += f"<div><a class='btn' href='/teacher/add_passage/{q['id']}'>Add Passage</a> "
+        html += f"<a class='btn' href='/teacher/view_quiz/{q['id']}'>View</a></div></div></div>"
     html += "<a class='btn' href='/teacher/dashboard'>Back</a>"
     return render_page(html)
 
@@ -503,19 +530,31 @@ def teacher_view_quiz(quiz_id):
         return redirect("/login/teacher")
     conn = get_db()
     quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-    qs = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
+    passages = conn.execute("SELECT * FROM passages WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
     conn.close()
     if not quiz:
         return render_page("<p>Quiz not found</p><a class='btn' href='/teacher/list_quizzes'>Back</a>")
-    html = f"<h2>{quiz['title']} — {quiz['subject']}</h2><h3>Questions</h3>"
-    if not qs:
-        html += "<p class='muted'>No questions yet</p>"
-    for q in qs:
-        html += f"<div class='card'><strong>Q{q['id']}</strong>: {q['text']}<div class='muted'>type: {q['qtype']} image: {q['image'] or 'none'}</div></div>"
+    html = f"<h2>{quiz['title']} — {quiz['subject']}</h2>"
+    html += "<h3>Passages & Questions</h3>"
+    if not passages:
+        html += "<p class='muted'>No passages yet</p>"
+    for p in passages:
+        html += f"<div class='card'><strong>Passage {p['id']}: {p['title'] or ''}</strong>"
+        if p['text_content']:
+            html += f"<div style='white-space:pre-wrap'>{p['text_content'][:400]}{'...' if len(p['text_content'])>400 else ''}</div>"
+        if p['image_url']:
+            html += f"<img class='responsive' src='{p['image_url']}' alt='passage image'>"
+        html += f"<div class='muted'><a class='btn' href='/teacher/add_question/{p['id']}'>Add Question</a></div></div>"
+        # show questions for this passage
+        conn = get_db()
+        qs = conn.execute("SELECT * FROM questions WHERE passage_id=? ORDER BY id", (p['id'],)).fetchall()
+        conn.close()
+        for q in qs:
+            html += f"<div style='padding:8px;border:1px solid #eee;margin:6px 0;border-radius:6px'>Q{q['id']}: {q['text']} <div class='muted'>type:{q['qtype']} image:{q['image_url'] or 'none'}</div></div>"
     html += "<a class='btn' href='/teacher/list_quizzes'>Back</a>"
     return render_page(html)
 
-# ---------- Teacher: students & per-student detail ----------
+# ----------------- Teacher: students & per-student history -----------------
 @app.route("/teacher/students")
 def teacher_students():
     if "teacher" not in session:
@@ -526,7 +565,7 @@ def teacher_students():
     html = "<h2>Students</h2>"
     for s in students:
         html += f"<div class='card'><div style='display:flex;justify-content:space-between;align-items:center'>"
-        html += f"<div><strong>{s['username']}</strong><div class='muted'>Grade: {s['grade']} • Class: {s['class_section']}</div></div>"
+        html += f"<div><strong>{s['username']}</strong><div class='muted'>Grade:{s['grade']} • Class:{s['class_section']}</div></div>"
         html += f"<div><a class='btn' href='/teacher/student/{s['id']}'>View History</a></div></div></div>"
     html += "<a class='btn' href='/teacher/dashboard'>Back</a>"
     return render_page(html)
@@ -538,12 +577,13 @@ def teacher_student_detail(student_id):
     conn = get_db()
     student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
     attempts = conn.execute("""
-      SELECT a.*, q.text AS question_text, qz.title AS quiz_title
+      SELECT a.*, q.text AS question_text, p.title AS passage_title, qz.title AS quiz_title
       FROM attempts a
       LEFT JOIN questions q ON a.question_id = q.id
+      LEFT JOIN passages p ON a.passage_id = p.id
       LEFT JOIN quizzes qz ON a.quiz_id = qz.id
       WHERE a.student_id = ?
-      ORDER BY a.id DESC
+      ORDER BY a.created_at DESC
     """, (student_id,)).fetchall()
     summary = conn.execute("""
       SELECT qz.id AS quiz_id, qz.title, SUM(a.correct) AS correct_count, COUNT(a.id) AS total
@@ -561,42 +601,44 @@ def teacher_student_detail(student_id):
             pct = round((s["correct_count"]/s["total"])*100,2) if s["total"]>0 else 0
             html += f"<div class='card'><strong>{s['title']}</strong> — {s['correct_count']}/{s['total']} correct ({pct}%)</div>"
     else:
-        html += "<p class='muted'>No attempts yet</p>"
-    html += "<h3>All attempts (recent)</h3>"
+        html += "<p class='muted'>No attempts</p>"
+    html += "<h3>All Attempts</h3>"
     for a in attempts:
-        html += f"<div class='card'>Quiz: {a['quiz_title']} — Q: {a['question_text']} — Ans: {a['student_answer']} — Correct: {a['correct']}</div>"
+        html += f"<div class='card'>Quiz:{a['quiz_title']} • Passage:{a['passage_title']} • Q:{a['question_text']} • Ans:{a['student_answer']} • Correct:{a['correct']}</div>"
     html += "<a class='btn' href='/teacher/students'>Back</a>"
     return render_page(html)
 
-# ---------- Teacher: download attempts PDF ----------
+# ----------------- Teacher: PDF export -----------------
 @app.route("/teacher/download_pdf_all")
 def teacher_download_pdf_all():
     if "teacher" not in session:
         return redirect("/login/teacher")
     conn = get_db()
     attempts = conn.execute("""
-      SELECT s.username, s.grade, s.class_section, qz.title AS quiz_title, a.correct
+      SELECT s.username, s.grade, s.class_section, qz.title as quiz_title, p.title as passage_title, q.text as question_text, a.student_answer, a.correct
       FROM attempts a
       JOIN students s ON a.student_id = s.id
       JOIN quizzes qz ON a.quiz_id = qz.id
-      ORDER BY s.grade, s.username
+      LEFT JOIN passages p ON a.passage_id = p.id
+      LEFT JOIN questions q ON a.question_id = q.id
+      ORDER BY s.grade, s.username, a.created_at DESC
     """).fetchall()
     conn.close()
-    html = "<html><head><meta charset='utf-8'><style>table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px;font-size:11px}</style></head><body>"
-    html += "<h2>Student Attempts Report</h2><table><tr><th>Username</th><th>Grade</th><th>Class</th><th>Quiz</th><th>Correct</th></tr>"
+    html = "<html><head><meta charset='utf-8'><style>table{width:100%;border-collapse:collapse}th,td{border:1px solid #ccc;padding:6px;font-size:11px}</style></head><body>"
+    html += "<h2>Student Attempts Report</h2><table><tr><th>Username</th><th>Grade</th><th>Class</th><th>Quiz</th><th>Passage</th><th>Question</th><th>Answer</th><th>Correct</th></tr>"
     for r in attempts:
-        html += f"<tr><td>{r['username']}</td><td>{r['grade']}</td><td>{r['class_section']}</td><td>{r['quiz_title']}</td><td>{r['correct']}</td></tr>"
+        html += f"<tr><td>{r['username']}</td><td>{r['grade']}</td><td>{r['class_section']}</td><td>{r['quiz_title']}</td><td>{r['passage_title'] or ''}</td><td>{(r['question_text'] or '')[:80]}</td><td>{(r['student_answer'] or '')[:80]}</td><td>{r['correct']}</td></tr>"
     html += "</table></body></html>"
-    pdf_bytes = html_to_pdf_bytes(html)
-    return send_file(pdf_bytes, as_attachment=True, download_name="attempts_report.pdf", mimetype="application/pdf")
+    pdf = html_to_pdf_bytes(html)
+    return send_file(pdf, as_attachment=True, download_name="attempts_report.pdf", mimetype="application/pdf")
 
-# ---------- Logout ----------
+# ----------------- Logout -----------------
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/")
 
-# ---------- Run ----------
+# ----------------- Run -----------------
 if __name__ == "__main__":
     print("Ambassador Quiz App running at http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
