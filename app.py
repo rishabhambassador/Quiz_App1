@@ -11,19 +11,17 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import secrets
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)
+app.secret_key = secrets.token_hex(32)
 DB_PATH = "quiz.db"
 
-# Teacher passkeys (teachers do NOT sign up)
+# ---------- Teacher passkeys (teachers don't sign up) ----------
 TEACHER_PASSKEYS = {
     "teacher1": "math123",
     "teacher2": "science456",
     "admin": "supersecret"
 }
 
-# -------------------------
-# Database init / helpers
-# -------------------------
+# ---------- DB helpers & init ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -33,7 +31,6 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # Students table (username acts as User ID)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +71,7 @@ def init_db():
         option_b TEXT,
         option_c TEXT,
         option_d TEXT,
-        qtype TEXT,    -- 'mcq' or 'subjective'
+        qtype TEXT,
         image_url TEXT,
         marks INTEGER DEFAULT 1,
         FOREIGN KEY (passage_id) REFERENCES passages(id)
@@ -97,10 +94,42 @@ def init_db():
 
 init_db()
 
-# -------------------------
-# Utility functions
-# -------------------------
+# ---------- Utilities ----------
+BASE_TEMPLATE = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ title }}</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+      body {{ font-family: Arial, Helvetica, sans-serif; background:#f6f8fb; margin:0; padding:20px; }}
+      .topbar {{ max-width:1100px; margin:0 auto 12px; display:flex; justify-content:space-between; align-items:center; }}
+      .brand {{ font-weight:bold; font-size:18px; }}
+      .nav-btn {{ display:inline-block; padding:8px 12px; margin-left:8px; background:#2b8cff; color:#fff; text-decoration:none; border-radius:6px; }}
+      .nav-btn:hover {{ background:#1f6fd6; }}
+      .card {{ max-width:1100px; margin:0 auto; background:#fff; padding:18px; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,0.06) }}
+      h1,h2 {{ text-align:center; margin:6px 0 }}
+      .btn {{ display:inline-block; padding:8px 14px; border-radius:6px; background:#2b8cff; color:#fff; text-decoration:none; border:none; cursor:pointer }}
+      .btn:hover {{ background:#1f6fd6 }}
+      .muted {{ color:#6b7280; font-size:14px }}
+      input, textarea, select {{ width:100%; padding:8px; margin:6px 0; border-radius:6px; border:1px solid #ddd; box-sizing:border-box }}
+      .row {{ display:flex; gap:12px }}
+      .col {{ flex:1 }}
+      img.responsive {{ max-width:100%; height:auto; border-radius:6px; margin-top:8px }}
+      .small {{ font-size:13px; color:#555 }}
+      @media(max-width:900px){{ .row {{ flex-direction: column; }} .topbar {{ padding:8px }} }}
+    </style>
+  </head>
+  <body>
+    <div class="topbar"><div class="brand">Ambassador Quiz App</div><div class="nav">{{ nav|safe }}</div></div>
+    <div class="card">{{ content|safe }}</div>
+  </body>
+</html>
+"""
+
 def render_page(content, title="Ambassador Quiz App"):
+    # navigation
     nav = "<a class='nav-btn' href='/'>Home</a> "
     if session.get("student_id"):
         nav += "<a class='nav-btn' href='/quiz/select'>My Quizzes</a> "
@@ -111,47 +140,13 @@ def render_page(content, title="Ambassador Quiz App"):
         nav += "<a class='nav-btn' href='/logout'>Logout</a>"
     else:
         nav += "<a class='nav-btn' href='/login'>Login</a> <a class='nav-btn' href='/signup'>Student Sign Up</a>"
-
-    base = """
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8"/>
-        <title>{title}</title>
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-        <style>
-          body {{ font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:18px; }}
-          .topbar {{ max-width:1100px; margin:0 auto 12px; display:flex; justify-content:space-between; align-items:center; }}
-          .brand {{ font-weight:bold; font-size:18px; }}
-          .nav-btn {{ display:inline-block; padding:8px 12px; margin-left:8px; background:#2b8cff; color:#fff; text-decoration:none; border-radius:6px; }}
-          .nav-btn:hover {{ background:#1f6fd6; }}
-          .card {{ max-width:1100px; margin:0 auto; background:#fff; padding:18px; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,0.06) }}
-          h1,h2 {{ text-align:center; margin:6px 0 }}
-          .btn {{ display:inline-block; padding:8px 14px; border-radius:6px; background:#2b8cff; color:#fff; text-decoration:none; border:none; cursor:pointer }}
-          .btn:hover {{ background:#1f6fd6 }}
-          .muted {{ color:#6b7280; font-size:14px }}
-          input, textarea, select {{ width:100%; padding:8px; margin:6px 0; border-radius:6px; border:1px solid #ddd; box-sizing:border-box }}
-          .row {{ display:flex; gap:12px }}
-          .col {{ flex:1 }}
-          img.responsive {{ max-width:100%; height:auto; border-radius:6px; margin-top:8px }}
-          .small {{ font-size:13px; color:#555 }}
-          @media(max-width:900px){{ .row {{ flex-direction: column; }} .topbar {{ padding:8px }} }}
-        </style>
-      </head>
-      <body>
-        <div class="topbar"><div class="brand">Ambassador Quiz App</div><div class="nav">{nav}</div></div>
-        <div class="card">
-          {content}
-        </div>
-      </body>
-    </html>
-    """
-    return render_template_string(base.format(content=content, nav=nav, title=title))
+    return render_template_string(BASE_TEMPLATE, title=title, nav=nav, content=content)
 
 def normalize_words(text):
     return re.findall(r"\w+", (text or "").lower())
 
 def check_similarity(ans, correct, threshold=0.6):
+    """Return 1 (true) if fraction of teacher words found in student's answer >= threshold."""
     if not ans or not correct:
         return 0
     a = normalize_words(ans)
@@ -162,9 +157,9 @@ def check_similarity(ans, correct, threshold=0.6):
     ratio = matches / len(c)
     return 1 if ratio >= threshold else 0
 
-def make_plot(labels, values, title, div_id):
+def make_plot(labels, values, title_text, div_id):
     fig = go.Figure([go.Bar(x=list(labels), y=list(values), marker_color="skyblue")])
-    fig.update_layout(title=title, yaxis=dict(title="Avg (%)", range=[0,100]), margin=dict(l=20,r=20,t=40,b=30), height=300)
+    fig.update_layout(title=title_text, yaxis=dict(title="Avg (%)", range=[0,100]), margin=dict(l=20,r=20,t=40,b=30), height=300)
     return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id)
 
 def html_to_pdf_bytes(source_html: str):
@@ -173,9 +168,7 @@ def html_to_pdf_bytes(source_html: str):
     out.seek(0)
     return out
 
-# -------------------------
-# Public routes
-# -------------------------
+# ---------- Public routes ----------
 @app.route("/")
 def home():
     conn = get_db()
@@ -195,9 +188,7 @@ def home():
         html += "<p class='muted'>No quizzes yet</p>"
     return render_page(html)
 
-# -------------------------
-# Signup & Login
-# -------------------------
+# ---------- Signup & Login ----------
 @app.route("/signup", methods=["GET","POST"])
 def signup():
     if request.method == "POST":
@@ -239,13 +230,11 @@ def signup():
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    # Combined login for student & teacher selection
     if request.method == "POST":
         role = request.form.get("role","student")
         username = request.form.get("username","").strip()
         password = request.form.get("password","")
         if role == "teacher":
-            # teacher passkey
             if username in TEACHER_PASSKEYS and TEACHER_PASSKEYS[username] == password:
                 session["teacher"] = username
                 return redirect("/teacher/dashboard")
@@ -276,9 +265,7 @@ def logout():
     session.clear()
     return redirect("/")
 
-# -------------------------
-# Teacher routes (create/manage/dashboard/pdf)
-# -------------------------
+# ---------- Teacher: Dashboard, Create, Passages, Questions ----------
 @app.route("/teacher/dashboard")
 def teacher_dashboard():
     if "teacher" not in session:
@@ -417,8 +404,7 @@ def teacher_add_question(passage_id):
             marks = 1
         conn = get_db()
         conn.execute("""INSERT INTO questions(passage_id,text,correct,option_a,option_b,option_c,option_d,qtype,image_url,marks)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                     (passage_id,text,correct,option_a,option_b,option_c,option_d,qtype,image_url,marks))
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""", (passage_id,text,correct,option_a,option_b,option_c,option_d,qtype,image_url,marks))
         conn.commit(); conn.close()
         return render_page(f"<p>Question added to passage '{passage['title'] or passage['id']}'</p>"
                            f"<a class='btn' href='/teacher/add_question/{passage_id}'>Add Another</a> "
@@ -479,7 +465,8 @@ def teacher_view_quiz(quiz_id):
     conn.close()
     if not quiz:
         return render_page("<p>Quiz not found</p><a class='btn' href='/teacher/list_quizzes'>Back</a>")
-    html = f"<h2>{quiz['title']} — {quiz['subject']}</h2><h3>Passages & Questions</h3>"
+    html = f"<h2>{quiz['title']} — {quiz['subject']}</h2>"
+    html += "<h3>Passages & Questions</h3>"
     if not passages:
         html += "<p class='muted'>No passages yet</p>"
     for p in passages:
@@ -497,9 +484,7 @@ def teacher_view_quiz(quiz_id):
     html += "<a class='btn' href='/teacher/list_quizzes'>Back</a>"
     return render_page(html)
 
-# -------------------------
-# Student flow (select/start/passages)
-# -------------------------
+# ---------- Student flow: select/start/passage ----------
 @app.route("/quiz/select")
 def student_select_quiz():
     if "student_id" not in session:
@@ -543,16 +528,16 @@ def quiz_passage(quiz_id, p_index):
         conn = get_db()
         for q in questions:
             ans = (request.form.get(f"q_{q['id']}") or "").strip()
+            # treat empty string as answered blank -> still recorded
             if (q["qtype"] or "").lower() == "mcq":
                 correct_flag = 1 if ans.lower() == (q["correct"] or "").lower() else 0
             else:
                 correct_flag = check_similarity(ans, q["correct"])
             conn.execute("INSERT INTO attempts(student_id,quiz_id,passage_id,question_id,student_answer,correct,created_at) VALUES (?,?,?,?,?,?,?)",
-                         (student_id, quiz_id, passage["id"], q["id"], ans, correct_flag, now))
+                         (student_id, quiz_id, passage["id"], q["id"], ans, int(correct_flag), now))
         conn.commit(); conn.close()
         next_index = p_index + 1
         if next_index >= len(passages):
-            # summary for student
             conn = get_db()
             summary = conn.execute("SELECT SUM(correct) as correct_count, COUNT(id) as total FROM attempts WHERE student_id=? AND quiz_id=?",
                                    (student_id, quiz_id)).fetchone()
@@ -616,9 +601,7 @@ def quiz_passage(quiz_id, p_index):
 
     return render_page(page)
 
-# -------------------------
-# Teacher: students & PDF export
-# -------------------------
+# ---------- Teacher: Students & Classwise PDF ----------
 @app.route("/teacher/students")
 def teacher_students():
     if "teacher" not in session:
@@ -691,9 +674,7 @@ def teacher_download_pdf_classwise():
     pdf_bytes = html_to_pdf_bytes(html)
     return send_file(pdf_bytes, as_attachment=True, download_name="classwise_report.pdf", mimetype="application/pdf")
 
-# -------------------------
-# Run server
-# -------------------------
+# ---------- Run ----------
 if __name__ == "__main__":
     print("Ambassador Quiz App running at http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
