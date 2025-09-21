@@ -1,4 +1,4 @@
 Flask==2.2.5
-matplotlib==3.0.0
-reportlab==3.6.12
+matplotlib==3.7.1
+fpdf==1.7.2
 gunicorn==21.2.0
