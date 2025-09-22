@@ -227,7 +227,7 @@ def home():
     content = """
     <div class="card center">
       <h1>Welcome to Ambassador Quiz App</h1>
-      <p class="muted">Adaptive assessment platform inspired by PISA layout</p>
+      <p class="muted">Adaptive assessment platform </p>
       <div style="margin-top:16px;">
         <a class="btn" href="/login">Sign In</a>
         <a class="btn alt" href="/signup">Student Sign Up</a>
@@ -771,3 +771,4 @@ def teacher_add_question_alias(passage_id):
 if __name__ == "__main__":
     print("Starting Ambassador Quiz App on http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
