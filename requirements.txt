@@ -1,6 +1,7 @@
-Flask>=2.2
-Flask-SQLAlchemy>=3.0
-SQLAlchemy>=2.0
-psycopg2-binary>=2.9   # only needed for Postgres usage
-werkzeug>=2.1
-fpdf>=1.7.2
+Flask
+SQLAlchemy
+psycopg2-binary
+Flask-Login
+Flask-WTF
+gunicorn
+matplotlib
