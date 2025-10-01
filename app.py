@@ -1,40 +1,43 @@
 # app.py
 """
-Ambassador Quiz App - single-file (Python-only UI)
+Ambassador Quiz App - single-file
 Features:
- - Student & Teacher sign-up (teacher requires passkey)
- - Login/logout
- - Placement (calibration)
- - Adaptive quizzes (passage selection by student level)
- - Teachers: create quiz, create passage, add question (attach to passage or standalone)
- - Teacher dashboard with tables (no JS)
- - Export PDF report
- - Reset DB, Seed sample data, Delete quiz
+ - Flask + Flask-SQLAlchemy
+ - Teacher: create regular or passage-based quizzes, mark as placement optional
+ - Student: signup/login, placement optional, quiz attempt with timer, screen-lock anti-cheat, practice mode
+ - Teacher dashboard with colorful matplotlib charts embedded as base64
+ - PDF export using fpdf2 (base64 data link)
+ - All HTML/CSS/JS inline via render_template_string
+ - No use of os module; set DATABASE_URL constant below for production
 """
-from flask import Flask, request, redirect, session, render_template_string, send_file
+
+from flask import Flask, request, redirect, session, render_template_string, url_for, send_file
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import secrets, random, io, os
+import secrets, re, random, base64, io
 from fpdf import FPDF
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# ------------- CONFIG -------------
+# ---------------- CONFIG ----------------
+# Change DATABASE_URL to your Postgres DB for production (Render)
+# Example: "postgresql+psycopg2://user:pass@host:port/dbname"
+DATABASE_URL = "sqlite:///ambassador_quiz.db"
+
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///app.db"
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.secret_key = secrets.token_hex(24)
+app.secret_key = secrets.token_hex(32)
 db = SQLAlchemy(app)
 
-# teacher passkeys required at signup if selecting Teacher role
-TEACHER_PASSKEYS = {"teacher1": "math123", "teacher2": "science456", "admin": "supersecret"}
-
-# ------------- MODELS -------------
-class User(db.Model):
+# ---------------- MODELS ----------------
+class Student(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(150), unique=True, nullable=False)
+    user_id = db.Column(db.String(150), unique=True, nullable=False)
     password = db.Column(db.String(300), nullable=False)
     name = db.Column(db.String(200))
-    role = db.Column(db.String(30), default="student")  # 'student' or 'teacher'
     grade = db.Column(db.String(50))
     class_section = db.Column(db.String(50))
     gender = db.Column(db.String(30))
@@ -45,733 +48,846 @@ class Quiz(db.Model):
     title = db.Column(db.String(300))
     grade = db.Column(db.String(50))
     subject = db.Column(db.String(100))
+    is_passage_based = db.Column(db.Integer, default=0)  # 0 false, 1 true
+    is_placement = db.Column(db.Integer, default=0)  # optional diagnostic flag
+    use_level_filter = db.Column(db.Integer, default=0)  # if true, filter questions by student.level
     timer_seconds = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Passage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    quiz_id = db.Column(db.Integer, db.ForeignKey("quiz.id"), nullable=False)
+    quiz_id = db.Column(db.Integer, nullable=True)
     title = db.Column(db.String(300))
     content = db.Column(db.Text)
-    difficulty = db.Column(db.String(20), default="medium")  # easy/medium/hard
 
 class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    quiz_id = db.Column(db.Integer, nullable=True)       # optional if standalone
-    passage_id = db.Column(db.Integer, nullable=True)    # optional if standalone
+    quiz_id = db.Column(db.Integer, nullable=True)    # For regular questions (non-passage), quiz_id used
+    passage_id = db.Column(db.Integer, nullable=True) # For passage-based questions
     text = db.Column(db.Text)
-    qtype = db.Column(db.String(50))  # Understanding/Application/Thinking
+    qtype = db.Column(db.String(50))  # 'mcq' or 'subjective'
     option_a = db.Column(db.String(500))
     option_b = db.Column(db.String(500))
     option_c = db.Column(db.String(500))
     option_d = db.Column(db.String(500))
-    correct = db.Column(db.String(500))  # for MCQ store 'A'/'B' etc or keyword for subjective
+    correct = db.Column(db.Text)  # store correct option text or keywords for subjective
     difficulty = db.Column(db.String(50), default="medium")  # easy/medium/hard
     marks = db.Column(db.Integer, default=1)
-    is_calibration = db.Column(db.Integer, default=0)  # 0/1 - used in placement
 
 class Attempt(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer)
-    quiz_id = db.Column(db.Integer, nullable=True)
+    student_id = db.Column(db.Integer)
+    quiz_id = db.Column(db.Integer)
     passage_id = db.Column(db.Integer, nullable=True)
     question_id = db.Column(db.Integer)
     student_answer = db.Column(db.Text)
-    correct = db.Column(db.Integer)  # 0/1
+    correct = db.Column(db.Integer)  # 0 or 1
     time_taken = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# create tables
 with app.app_context():
     db.create_all()
 
-# ------------- Helpers -------------
-import re
-def normalize_words(text):
-    if not text:
-        return set()
-    return set(re.findall(r"\w+", text.lower()))
+# ---------------- Teacher passkeys ----------------
+TEACHER_PASSKEYS = {"teacher1": "math123", "teacher2": "science456", "admin": "supersecret"}
+
+# ---------------- Utilities ----------------
+_word_re = re.compile(r"\w+")
+
+def normalize_words(txt):
+    if not txt: return set()
+    return set(_word_re.findall(txt.lower()))
 
 def subjective_similarity(student_ans, teacher_ans):
-    s = normalize_words(student_ans)
-    t = normalize_words(teacher_ans)
-    if not t:
-        return 0.0
+    s = normalize_words(student_ans or "")
+    t = normalize_words(teacher_ans or "")
+    if not t: return 0.0
     matches = sum(1 for w in t if w in s)
     return matches / len(t)
 
-def grade_level_from_score(score, total):
+def assign_level_by_score(score, total):
     if total == 0:
         return "unknown"
-    pct = (score / total) * 100
+    pct = (score*100.0)/total
     if pct >= 80:
         return "advanced"
     if pct >= 40:
         return "intermediate"
     return "beginner"
 
-def generate_pdf_bytes(user_rows):
+def make_plot_base64(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+def student_report_pdf_bytes(rows):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 14)
     pdf.cell(0, 10, "Student Report - Ambassador Quiz App", ln=True, align="C")
     pdf.ln(6)
     pdf.set_font("Arial", size=10)
-    headers = ["User", "Name", "Grade", "Class", "Gender", "Role", "Level", "Attempts", "Correct"]
-    widths = [30, 40, 18, 18, 18, 18, 20, 18, 18]
+    headers = ["User ID", "Name", "Grade", "Class", "Gender", "Level", "Attempts", "Correct"]
+    widths = [30, 40, 18, 18, 18, 24, 18, 18]
     for h,w in zip(headers,widths):
-        pdf.cell(w,8,h,1,0,"C")
+        pdf.cell(w,8,h,1,0,'C')
     pdf.ln()
-    for r in user_rows:
-        pdf.cell(widths[0],8,str(r.get("username","")),1)
+    for r in rows:
+        pdf.cell(widths[0],8,str(r.get("user_id","")),1)
         pdf.cell(widths[1],8,str(r.get("name","")),1)
         pdf.cell(widths[2],8,str(r.get("grade","") or ""),1)
         pdf.cell(widths[3],8,str(r.get("class","") or ""),1)
         pdf.cell(widths[4],8,str(r.get("gender","") or ""),1)
-        pdf.cell(widths[5],8,str(r.get("role","") or ""),1)
-        pdf.cell(widths[6],8,str(r.get("level","") or ""),1)
-        pdf.cell(widths[7],8,str(r.get("attempts",0)),1,0,"C")
-        pdf.cell(widths[8],8,str(r.get("correct",0)),1,1,"C")
-    return pdf.output(dest="S").encode("latin1")
+        pdf.cell(widths[5],8,str(r.get("level","") or ""),1)
+        pdf.cell(widths[6],8,str(r.get("attempts",0)),1,0,'C')
+        pdf.cell(widths[7],8,str(r.get("correct",0)),1,1,'C')
+    return pdf.output(dest='S').encode('latin1')
 
-# ------------- Templates (simple, no JS) -------------
-BASE = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ambassador Quiz App</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<style> body{background:#f8fafc;color:#0f1724;font-family:Inter,Arial;} .card{border-radius:8px} .muted{color:#6b7280} table td,table th{vertical-align:middle}</style>
-</head><body>
-<nav class="navbar navbar-expand-lg" style="background:#0b3b6f"><div class="container-fluid"><a class="navbar-brand text-white" href="/">Ambassador Quiz App</a>
-<div class="ms-auto">
-{% if session.get('user_id') %}
-  <span class="text-white me-2">{{ session.get('username') }} ({{ session.get('role') }})</span>
-  <a class="btn btn-light btn-sm" href="/logout">Logout</a>
-{% else %}
-  <a class="btn btn-light btn-sm" href="/login">Login</a>
-  <a class="btn btn-outline-light btn-sm" href="/signup">Sign Up</a>
-{% endif %}
-</div></div></nav>
-<div class="container my-4">{{ content|safe }}</div></body></html>
+# ---------------- Base HTML ----------------
+BASE_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Ambassador Quiz App</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    /* Minimal inline CSS to avoid external dependencies */
+    :root { --brand:#0b2653; --accent:#7c3aed; --muted:#64748b; --bg:#f6fbff; }
+    body { font-family:Inter,Arial,Helvetica,sans-serif; margin:0; background:var(--bg); color:#0f1724; }
+    header { background:var(--brand); color:white; padding:14px 18px; display:flex; align-items:center; justify-content:space-between; }
+    a { color:inherit; text-decoration:none; }
+    .container { max-width:1100px; margin:22px auto; padding:0 16px; }
+    .card { background:white; border-radius:10px; padding:16px; box-shadow:0 8px 30px rgba(2,6,23,0.06); margin-bottom:16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .col { flex:1; min-width:240px; }
+    .btn { display:inline-block; padding:8px 12px; border-radius:8px; background:var(--brand); color:white; border:none; cursor:pointer; text-decoration:none; margin:4px 0; }
+    .btn.alt { background:#eef2ff; color:var(--brand); }
+    input, textarea, select { width:100%; padding:8px; margin:6px 0 12px; border-radius:8px; border:1px solid #e6eefc; box-sizing:border-box; }
+    .muted { color:var(--muted); font-size:14px; }
+    .small { font-size:13px; color:#475569; }
+    .tag { padding:6px 8px; border-radius:8px; background:#eef2ff; color:var(--brand); font-weight:600; display:inline-block; margin:2px; }
+    .progress { height:10px; background:#eef2ff; border-radius:8px; overflow:hidden; margin-top:8px; }
+    .progress > div { height:100%; background:linear-gradient(90deg,var(--brand),var(--accent)); }
+    .warning { background:#fef3c7; border-left:4px solid #f59e0b; padding:8px; border-radius:6px; }
+    footer { text-align:center; color:var(--muted); font-size:13px; margin:28px 0; }
+    @media(max-width:900px){ .row{ flex-direction:column } header nav{display:none} }
+  </style>
+</head>
+<body>
+<header>
+  <div style="font-weight:700;font-size:18px">Ambassador Quiz App</div>
+  <nav>
+    {% if session.get('student_id') %}
+      <a class="btn alt" href="/student/dashboard">Student</a>
+      <a class="btn alt" href="/logout">Logout</a>
+    {% elif session.get('teacher') %}
+      <a class="btn alt" href="/teacher/dashboard">Teacher</a>
+      <a class="btn alt" href="/logout">Logout</a>
+    {% else %}
+      <a class="btn alt" href="/login">Login</a>
+      <a class="btn alt" href="/signup">Sign Up</a>
+    {% endif %}
+  </nav>
+</header>
+<div class="container">
+  {{ content|safe }}
+</div>
+<footer>Ambassador Quiz App — single-file deployment</footer>
+</body>
+</html>
 """
 
-# ------------- Routes -------------
+# ---------------- Routes ----------------
+
 @app.route("/")
 def home():
     content = """
-    <div class='card p-4'>
-      <div class='d-flex justify-content-between align-items-center'>
-        <div>
-          <h2>Ambassador Quiz App</h2>
-          <p class='muted'>Adaptive quizzes, placement, teacher dashboard — Python-only UI.</p>
-        </div>
-        <div>
-          <a class='btn btn-primary' href='/login'>Login</a>
-          <a class='btn btn-outline-primary' href='/signup'>Sign Up</a>
-        </div>
+    <div class="card">
+      <h1>Welcome to Ambassador Quiz App</h1>
+      <p class="muted">Create quizzes (regular or passage-based), perform placement tests, and view rich teacher analytics.</p>
+      <p><a class="btn" href="/login">Login</a> <a class="btn alt" href="/signup">Student Sign Up</a></p>
+    </div>
+    <div class="row">
+      <div class="col card">
+        <h3>How it works</h3>
+        <p class="muted">Teachers create quizzes and questions. Students take quizzes passage-by-passage (if configured) with timers and anti-cheat protections.</p>
       </div>
-    </div>"""
-    return render_template_string(BASE, content=content)
+      <div class="col card">
+        <h3>Quick actions</h3>
+        <p><a class="btn" href="/login">Sign In</a> <a class="btn alt" href="/signup">Sign Up</a></p>
+      </div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, content=content)
 
-# ---------- Signup with role selection ----------
+# ---------- Signup ----------
 @app.route("/signup", methods=["GET","POST"])
 def signup():
     if request.method == "POST":
-        username = request.form.get("username","").strip()
+        user_id = request.form.get("user_id","").strip()
         password = request.form.get("password","")
         name = request.form.get("name","").strip()
-        role = request.form.get("role","student")
         grade = request.form.get("grade","").strip()
         class_section = request.form.get("class_section","").strip()
         gender = request.form.get("gender","").strip()
-        teacher_name = request.form.get("teacher_name","").strip()
-        teacher_passkey = request.form.get("teacher_passkey","").strip()
-
-        if not username or not password:
-            return render_template_string(BASE, content="<div class='card p-3'>Username and password required</div>")
-
-        if User.query.filter_by(username=username).first():
-            return render_template_string(BASE, content="<div class='card p-3'>Username exists. <a href='/signup'>Back</a></div>")
-
-        if role == "teacher":
-            # require valid teacher passkey for teacher creation
-            if TEACHER_PASSKEYS.get(teacher_name) != teacher_passkey:
-                return render_template_string(BASE, content="<div class='card p-3'>Invalid teacher passkey. Ask admin.</div>")
-            role_final = "teacher"
-        else:
-            role_final = "student"
-
+        if not user_id or not password:
+            return render_template_string(BASE_HTML, content="<div class='card'>User ID and password are required.</div>")
+        if Student.query.filter_by(user_id=user_id).first():
+            return render_template_string(BASE_HTML, content="<div class='card'>User ID already exists. <a href='/signup'>Back</a></div>")
         hashed = generate_password_hash(password)
-        user = User(username=username, password=hashed, name=name, role=role_final, grade=grade, class_section=class_section, gender=gender)
-        db.session.add(user); db.session.commit()
-        return redirect("/login")
-
+        st = Student(user_id=user_id, password=hashed, name=name, grade=grade, class_section=class_section, gender=gender)
+        db.session.add(st); db.session.commit()
+        return redirect(url_for("login"))
     content = """
-    <div class='card p-3' style='max-width:720px;margin:auto'>
-      <h3>Sign Up</h3>
-      <form method='post'>
-        <input class='form-control mb-2' name='name' placeholder='Full name'>
-        <input class='form-control mb-2' name='username' placeholder='Username' required>
-        <input class='form-control mb-2' type='password' name='password' placeholder='Password' required>
-        <div class='row'><div class='col'><input class='form-control mb-2' name='grade' placeholder='Grade'></div><div class='col'><input class='form-control mb-2' name='class_section' placeholder='Class'></div></div>
-        <select class='form-select mb-2' name='gender'><option>Male</option><option>Female</option><option>Other</option></select>
-        <div class='mb-2'>
-          <label>Role</label>
-          <select class='form-select' name='role' id='role_select' onchange="document.getElementById('teacher_fields').style.display=(this.value==='teacher'?'block':'none')">
-            <option value='student' selected>Student</option><option value='teacher'>Teacher</option>
-          </select>
-        </div>
-        <div id='teacher_fields' style='display:none'>
-          <input class='form-control mb-2' name='teacher_name' placeholder='teacher1 (passkey owner)'>
-          <input class='form-control mb-2' name='teacher_passkey' placeholder='Passkey'>
-        </div>
-        <button class='btn btn-primary' type='submit'>Sign Up</button>
+    <div class="card" style="max-width:720px;margin:auto">
+      <h2>Student Sign Up</h2>
+      <form method="post">
+        Name: <input name="name" placeholder="Full name">
+        User ID: <input name="user_id" placeholder="Unique user id" required>
+        Password: <input type="password" name="password" required>
+        <div style="display:flex;gap:8px"><input name="grade" placeholder="Grade"><input name="class_section" placeholder="Class/section"></div>
+        Gender: <select name="gender"><option>Male</option><option>Female</option><option>Other</option></select>
+        <button class="btn" type="submit">Sign Up</button>
       </form>
     </div>
-    <script>/* minimal inline to toggle teacher fields; remains within template */</script>
     """
-    return render_template_string(BASE, content=content)
+    return render_template_string(BASE_HTML, content=content)
 
 # ---------- Login ----------
 @app.route("/login", methods=["GET","POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username","").strip()
-        password = request.form.get("password","")
-        user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password, password):
-            session.clear()
-            session["user_id"] = user.id
-            session["username"] = user.username
-            session["role"] = user.role
-            return redirect("/dashboard")
-        return render_template_string(BASE, content="<div class='card p-3'>Invalid credentials</div>")
+        role = request.form.get("role","student")
+        if role == "teacher":
+            tname = request.form.get("teacher_name","")
+            passkey = request.form.get("passkey","")
+            if TEACHER_PASSKEYS.get(tname) == passkey:
+                session.clear(); session["teacher"] = tname; return redirect(url_for("teacher_dashboard"))
+            return render_template_string(BASE_HTML, content="<div class='card'>Invalid teacher credentials. <a href='/login'>Back</a></div>")
+        else:
+            user_id = request.form.get("user_id","").strip()
+            password = request.form.get("password","")
+            st = Student.query.filter_by(user_id=user_id).first()
+            if st and check_password_hash(st.password, password):
+                session.clear()
+                session["student_id"] = st.id
+                session["student_user_id"] = st.user_id
+                session["grade"] = st.grade
+                # If level unknown, suggest placement (not forced)
+                if not st.level or st.level in ("unknown",""):
+                    return redirect(url_for("student_dashboard"))
+                return redirect(url_for("student_dashboard"))
+            return render_template_string(BASE_HTML, content="<div class='card'>Invalid student credentials. <a href='/login'>Back</a></div>")
     content = """
-    <div class='card p-3' style='max-width:480px;margin:auto'>
-      <h3>Login</h3>
-      <form method='post'>
-        <input class='form-control mb-2' name='username' placeholder='Username' required>
-        <input class='form-control mb-2' name='password' placeholder='Password' type='password' required>
-        <button class='btn btn-primary' type='submit'>Login</button>
+    <div class="card" style="max-width:720px;margin:auto">
+      <h2>Sign In</h2>
+      <form method="post">
+        Role: <select name="role"><option value="student">Student</option><option value="teacher">Teacher</option></select>
+        <div class="student-fields"><input name="user_id" placeholder="User ID"><input type="password" name="password" placeholder="Password"></div>
+        <div id="teacher_fields" style="display:none"><input name="teacher_name" placeholder="Teacher name"><input type="password" name="passkey" placeholder="Passkey"></div>
+        <button class="btn" type="submit">Sign In</button>
       </form>
-      <div class='mt-2'><a href='/signup'>Sign Up</a></div>
     </div>
+    <script>
+      const sel = document.querySelector('select[name="role"]');
+      sel.addEventListener('change', ()=> {
+        if(sel.value==='teacher'){ document.querySelectorAll('.student-fields input').forEach(i=>i.style.display='none'); document.getElementById('teacher_fields').style.display='block'; }
+        else{ document.querySelectorAll('.student-fields input').forEach(i=>i.style.display='block'); document.getElementById('teacher_fields').style.display='none'; }
+      });
+    </script>
     """
-    return render_template_string(BASE, content=content)
+    return render_template_string(BASE_HTML, content=content)
 
 # ---------- Logout ----------
 @app.route("/logout")
 def logout():
-    session.clear()
-    return redirect("/")
-
-# ---------- Placement (calibration) ----------
-@app.route("/placement", methods=["GET","POST"])
-def placement():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    cal_questions = Question.query.filter_by(is_calibration=1).all()
-    if not cal_questions:
-        return render_template_string(BASE, content="<div class='card p-3'>No calibration questions available. Ask teacher to add them.</div>")
-
-    chosen = random.sample(cal_questions, min(5, len(cal_questions)))
-    if request.method == "POST":
-        answers = {k: v for k,v in request.form.items() if k.startswith("q_")}
-        score = 0; total = 0
-        for key, val in answers.items():
-            qid = int(key.split("_",1)[1]); q = Question.query.get(qid)
-            if not q: continue
-            total += 1
-            if q.option_a or q.option_b or q.option_c or q.option_d:
-                if (val or "").strip().upper() == (q.correct or "").strip().upper():
-                    score += 1
-            else:
-                sim = subjective_similarity(val or "", q.correct or "")
-                if sim >= 0.6:
-                    score += 1
-        level = grade_level_from_score(score, total)
-        user.level = level
-        db.session.commit()
-        return render_template_string(BASE, content=f"<div class='card p-3'>Placement done. Level assigned: <b>{level}</b><br><a class='btn btn-primary mt-2' href='/dashboard'>Go to Dashboard</a></div>")
-
-    html = "<div class='card p-3'><h4>Placement Calibration</h4><form method='post'>"
-    for q in chosen:
-        html += f"<div class='mb-3'><b>{q.text}</b><div class='muted small'>Type: {q.qtype or 'N/A'}</div>"
-        if q.option_a or q.option_b or q.option_c or q.option_d:
-            for label,opt in (('A','option_a'),('B','option_b'),('C','option_c'),('D','option_d')):
-                val = getattr(q,opt)
-                if val:
-                    html += f"<div><label><input type='radio' name='q_{q.id}' value='{label}'> {label}. {val}</label></div>"
-        else:
-            html += f"<textarea class='form-control' name='q_{q.id}' rows='3'></textarea>"
-        html += "</div>"
-    html += "<button class='btn btn-primary' type='submit'>Submit Placement</button></form></div>"
-    return render_template_string(BASE, content=html)
+    session.clear(); return redirect(url_for("home"))
 
 # ---------- Student Dashboard ----------
-@app.route("/dashboard")
-def dashboard():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    # summary
-    total = db.session.query(Attempt).filter_by(user_id=user.id).count()
-    correct = db.session.query(db.func.sum(Attempt.correct)).filter_by(user_id=user.id).scalar() or 0
-    accuracy = f"{(correct/total*100):.2f}%" if total>0 else "N/A"
-
-    # recent attempts (limit 20)
-    attempts = db.session.query(Attempt).filter_by(user_id=user.id).order_by(Attempt.created_at.desc()).limit(20).all()
-    attempt_rows = []
+@app.route("/student/dashboard")
+def student_dashboard():
+    if "student_id" not in session:
+        return redirect(url_for("login"))
+    sid = session["student_id"]
+    st = Student.query.get(sid)
+    # Suggest placement if unknown
+    placement_notice = ""
+    if not st.level or st.level in ("unknown",""):
+        placement_notice = "<div class='card'><p class='muted'>We recommend taking a short placement test to set your level. <a href='/placement'>Take placement test</a></p></div>"
+    # recent attempts
+    attempts = Attempt.query.filter_by(student_id=sid).order_by(Attempt.created_at.desc()).limit(15).all()
+    attempts_html = ""
     for a in attempts:
         q = Question.query.get(a.question_id)
-        attempt_rows.append({
-            "text": q.text if q else "Question",
-            "ans": a.student_answer,
-            "correct": a.correct,
-            "when": a.created_at.strftime("%Y-%m-%d %H:%M")
-        })
-
-    # teacher view: summary lists
-    teachers_links = ""
-    if user.role == "teacher":
-        teachers_links = """
-          <div class='card p-3 mt-3'>
-            <h5>Teacher Actions</h5>
-            <a class='btn btn-primary' href='/teacher/create_quiz'>Create Quiz</a>
-            <a class='btn btn-outline-secondary' href='/teacher/dashboard'>Teacher Dashboard</a>
-            <a class='btn btn-outline-danger' href='/teacher/reset_confirm'>Reset DB</a>
-          </div>
-        """
-
+        attempts_html += f"<div style='border-bottom:1px solid #f1f5f9;padding:10px 0'><b>{(q.text if q else 'Question')}</b><div class='muted small'>Answer: {a.student_answer or ''} • Correct: {a.correct}</div></div>"
+    # available quizzes
+    grade = st.grade or ""
+    quizzes = Quiz.query.filter((Quiz.grade==grade) | (Quiz.grade==None) | (Quiz.grade=="")).order_by(Quiz.created_at.desc()).all()
+    quiz_list_html = ""
+    for q in quizzes:
+        quiz_list_html += f"<div style='display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f1f5f9'><div><b>{q.title}</b><div class='muted'>{q.subject} • Grade {q.grade} • {'Passage' if q.is_passage_based else 'Regular'}</div></div><div><a class='btn' href='/quiz/start/{q.id}'>Start</a></div></div>"
     content = f"""
-    <div class='card p-3'><h4>Welcome, {user.name or user.username} ({user.role})</h4>
-      <div class='muted'>Level: <b>{user.level}</b> • Grade: {user.grade or 'N/A'}</div>
-      <div class='mt-2'>Total answered: <b>{total}</b> • Correct: <b>{correct}</b> • Accuracy: <b>{accuracy}</b></div>
-      <div class='mt-3'><a class='btn btn-primary' href='/quiz/list'>Take Quiz</a> <a class='btn btn-outline-primary' href='/report'>Download Report (PDF)</a></div>
+    <div class='card'><h2>Welcome, {st.name or st.user_id}</h2><div class='muted'>Level: <span class='tag'>{st.level}</span></div></div>
+    {placement_notice}
+    <div class='row'>
+      <div class='col card'><h3>Available Quizzes</h3>{quiz_list_html or '<p class=\"muted\">No quizzes available</p>'}</div>
+      <div class='col card'><h3>Recent Attempts</h3>{attempts_html or '<p class=\"muted\">No attempts yet</p>'}</div>
     </div>
-    <div class='card p-3 mt-3'><h5>Recent Attempts</h5>
     """
-    if not attempt_rows:
-        content += "<p class='muted'>No attempts yet</p>"
-    else:
-        content += "<table class='table table-sm'><thead><tr><th>Question</th><th>Answer</th><th>Correct</th><th>When</th></tr></thead><tbody>"
-        for r in attempt_rows:
-            content += f"<tr><td>{r['text']}</td><td>{r['ans'] or ''}</td><td>{'Yes' if r['correct'] else 'No'}</td><td>{r['when']}</td></tr>"
-        content += "</tbody></table>"
-    content += "</div>" + teachers_links
-    return render_template_string(BASE, content=content)
+    return render_template_string(BASE_HTML, content=content)
 
-# ---------- Quiz list ----------
-@app.route("/quiz/list")
-def quiz_list():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    quizzes = Quiz.query.order_by(Quiz.created_at.desc()).all()
-    html = "<div class='card p-3'><h4>Available Quizzes</h4>"
-    if not quizzes:
-        html += "<p class='muted'>No quizzes available</p>"
-    else:
-        html += "<table class='table table-sm'><thead><tr><th>Title</th><th>Subject</th><th>Grade</th><th>Action</th></tr></thead><tbody>"
-        for q in quizzes:
-            html += f"<tr><td>{q.title}</td><td>{q.subject or ''}</td><td>{q.grade or 'All'}</td><td><a class='btn btn-primary btn-sm' href='/quiz/start/{q.id}'>Start</a></td></tr>"
-        html += "</tbody></table>"
-    html += "</div>"
-    return render_template_string(BASE, content=html)
-
-# ---------- Start quiz -> choose passage adaptively ----------
-@app.route("/quiz/start/<int:quiz_id>")
-def quiz_start(quiz_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    return redirect(f"/quiz/{quiz_id}/begin")
-
-@app.route("/quiz/<int:quiz_id>/begin")
-def quiz_begin(quiz_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    quiz = Quiz.query.get(quiz_id)
-    if not quiz:
-        return render_template_string(BASE, content="<div class='card p-3'>Quiz not found</div>")
-    diff_map = {"beginner":"easy","intermediate":"medium","advanced":"hard"}
-    desired = diff_map.get(user.level, None)
-    passages = []
-    if desired:
-        passages = Passage.query.filter_by(quiz_id=quiz_id, difficulty=desired).all()
-    if not passages:
-        passages = Passage.query.filter_by(quiz_id=quiz_id).all()
-    if not passages:
-        return render_template_string(BASE, content="<div class='card p-3'>No passages in this quiz</div>")
-    passage = random.choice(passages)
-    return redirect(f"/quiz/{quiz_id}/passage/{passage.id}")
-
-# ---------- Quiz passage (questions selection & submit) ----------
-@app.route("/quiz/<int:quiz_id>/passage/<int:passage_id>", methods=["GET","POST"])
-def quiz_passage(quiz_id, passage_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    quiz = Quiz.query.get(quiz_id); passage = Passage.query.get(passage_id)
-    if not quiz or not passage:
-        return render_template_string(BASE, content="<div class='card p-3'>Quiz or passage not found</div>")
-
+# ---------- Placement Test (optional) ----------
+@app.route("/placement", methods=["GET","POST"])
+def placement():
+    if "student_id" not in session:
+        return redirect(url_for("login"))
+    sid = session["student_id"]
+    st = Student.query.get(sid)
+    # pick up to 5 sample questions across difficulties
+    all_qs = Question.query.all()
+    if not all_qs:
+        return render_template_string(BASE_HTML, content="<div class='card'>No questions available for placement. Ask a teacher to add questions.</div>")
+    chosen = []
+    def pick(diff, n):
+        pool = [q for q in all_qs if q.difficulty==diff]
+        return random.sample(pool, min(n, len(pool)))
+    chosen += pick("easy",2); chosen += pick("medium",2); chosen += pick("hard",1)
+    if len(chosen) < 5:
+        pool = [q for q in all_qs if q not in chosen]
+        if pool:
+            chosen += random.sample(pool, min(5 - len(chosen), len(pool)))
     if request.method == "POST":
-        qids_raw = request.form.get("qids","")
-        qids = [int(x) for x in qids_raw.split(",")] if qids_raw else []
-        selected = Question.query.filter(Question.id.in_(qids)).all()
-        total = 0; correct = 0
-        for q in selected:
+        answers = {int(k.split("_",1)[1]):v for k,v in request.form.items() if k.startswith("q_")}
+        score = 0; total = 0
+        for qid, ans in answers.items():
+            q = Question.query.get(qid)
+            if not q: continue
             total += 1
-            ans = request.form.get(f"q_{q.id}", "")
-            if q.option_a or q.option_b or q.option_c or q.option_d:
-                flag = 1 if (ans or "").strip().upper() == (q.correct or "").strip().upper() else 0
+            if q.qtype == "mcq":
+                if (ans or "").strip().lower() == (q.correct or "").strip().lower():
+                    score += 1
             else:
                 sim = subjective_similarity(ans or "", q.correct or "")
-                flag = 1 if sim >= 0.6 else 0
-            a = Attempt(user_id=user.id, quiz_id=quiz_id, passage_id=passage_id, question_id=q.id, student_answer=ans, correct=int(flag), time_taken=float(request.form.get(f"t_{q.id}",0) or 0))
-            db.session.add(a)
-            correct += int(flag)
+                if sim >= 0.6: score += 1
+        level = assign_level_by_score(score, total)
+        st.level = level
         db.session.commit()
-        pct = round((correct/total)*100,2) if total>0 else 0.0
-        return render_template_string(BASE, content=f"<div class='card p-3'><h4>Completed</h4><p class='muted'>Correct: {correct}/{total} • Score: {pct}%</p><a class='btn btn-primary mt-2' href='/dashboard'>Back</a></div>")
-
-    # GET: select pool by student level
-    if user.level == "beginner":
-        pool = Question.query.filter_by(passage_id=passage_id).filter(Question.difficulty.in_(["easy","medium"])).all()
-    elif user.level == "intermediate":
-        pool = Question.query.filter_by(passage_id=passage_id).filter(Question.difficulty.in_(["medium","hard"])).all()
-    elif user.level == "advanced":
-        pool = Question.query.filter_by(passage_id=passage_id).filter(Question.difficulty.in_(["hard","medium"])).all()
-    else:
-        pool = Question.query.filter_by(passage_id=passage_id).all()
-    if not pool:
-        pool = Question.query.filter_by(passage_id=passage_id).all()
-    selected = random.sample(pool, min(5, len(pool)))
-    qids = ",".join(str(q.id) for q in selected)
-
-    html = f"<div class='card p-3'><h4>{quiz.title}</h4><div class='muted'>{quiz.subject or 'General'} • Grade {quiz.grade or 'All'}</div></div>"
-    html += "<div class='card p-3'><h5>Passage</h5>"
-    if passage.title:
-        html += f"<h6>{passage.title}</h6>"
-    if passage.content:
-        html += f"<div class='muted' style='white-space:pre-wrap'>{passage.content}</div>"
-    html += "<form method='post'>"
-    for q in selected:
-        html += f"<div class='mt-3 p-2' style='border-radius:8px;border:1px solid #eef2ff'><p><b>{q.text}</b> <span class='muted small'>({q.qtype or 'N/A'} • {q.difficulty})</span></p>"
-        if q.option_a or q.option_b or q.option_c or q.option_d:
-            for label, opt in (('A','option_a'),('B','option_b'),('C','option_c'),('D','option_d')):
-                val = getattr(q, opt)
+        return render_template_string(BASE_HTML, content=f"<div class='card'><h3>Placement complete</h3><p class='muted'>Assigned level: <span class='tag'>{level}</span></p><a class='btn' href='/student/dashboard'>Go to Dashboard</a></div>")
+    q_html = "<form method='post'>"
+    for q in chosen:
+        q_html += f"<div class='card'><b>{q.text}</b><div class='muted small'>Difficulty: {q.difficulty}</div>"
+        if q.qtype == "mcq":
+            for opt in ("option_a","option_b","option_c","option_d"):
+                val = getattr(q,opt)
                 if val:
-                    html += f"<div><label><input type='radio' name='q_{q.id}' value='{label}'> {label}. {val}</label></div>"
+                    q_html += f"<div><label><input type='radio' name='q_{q.id}' value='{val}'> {val}</label></div>"
         else:
-            html += f"<textarea class='form-control' name='q_{q.id}' rows='3'></textarea>"
-        html += f"<input type='hidden' name='t_{q.id}' value='0'>"
-        html += "</div>"
-    html += f"<input type='hidden' name='qids' value='{qids}'>"
-    html += "<div class='mt-3'><button class='btn btn-primary' type='submit'>Submit Passage</button> <a class='btn btn-outline-secondary' href='/quiz/list'>Exit</a></div></form></div>"
-    return render_template_string(BASE, content=html)
+            q_html += f"<textarea name='q_{q.id}' rows='3' placeholder='Your answer...'></textarea>"
+        q_html += "</div>"
+    q_html += "<button class='btn' type='submit'>Submit Placement</button></form>"
+    return render_template_string(BASE_HTML, content=q_html)
+
+# ---------- Quiz start redirect ----------
+@app.route("/quiz/start/<int:quiz_id>")
+def quiz_start(quiz_id):
+    if "student_id" not in session:
+        return redirect(url_for("login"))
+    return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=0))
+
+# ---------- Quiz passage / regular question page ----------
+@app.route("/quiz/<int:quiz_id>/passage/<int:p_index>", methods=["GET","POST"])
+def quiz_passage(quiz_id, p_index):
+    if "student_id" not in session:
+        return redirect(url_for("login"))
+    student = Student.query.get(session["student_id"])
+    quiz = Quiz.query.get(quiz_id)
+    if not quiz:
+        return render_template_string(BASE_HTML, content="<div class='card'>Quiz not found</div>")
+    # load passages if passage_based else create synthetic single passage that contains regular questions
+    if quiz.is_passage_based:
+        passages = Passage.query.filter_by(quiz_id=quiz_id).order_by(Passage.id).all()
+        if not passages:
+            return render_template_string(BASE_HTML, content="<div class='card'>No passages in this quiz</div>")
+        if p_index < 0 or p_index >= len(passages):
+            return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=0))
+        passage = passages[p_index]
+        questions = Question.query.filter_by(passage_id=passage.id).order_by(Question.id).all()
+    else:
+        # regular quiz: consider all questions with quiz_id
+        passage = None
+        questions_all = Question.query.filter_by(quiz_id=quiz_id).order_by(Question.id).all()
+        # pack into "pages" of up to 5 questions
+        page_size = 5
+        pages = [questions_all[i:i+page_size] for i in range(0, len(questions_all), page_size)] if questions_all else [[]]
+        if p_index < 0 or p_index >= len(pages):
+            return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=0))
+        questions = pages[p_index]
+    # Adaptive: if quiz.use_level_filter, filter questions by student.level
+    if quiz.use_level_filter and student.level and student.level!="unknown":
+        filtered = [q for q in questions if q.difficulty in ( "easy","medium","hard" ) and (
+            (student.level=="beginner" and q.difficulty in ("easy","medium")) or
+            (student.level=="intermediate" and q.difficulty in ("medium","hard")) or
+            (student.level=="advanced" and q.difficulty in ("hard","medium"))
+        )]
+        if filtered:
+            questions = filtered
+    # pick up to 5 questions to display
+    display_questions = questions[:5]
+    # POST: handle submission (grading)
+    if request.method == "POST":
+        # detect if this is practice mode submission (practice flag)
+        practice = request.form.get("practice","") == "1"
+        now = datetime.utcnow()
+        for q in display_questions:
+            ans = request.form.get(f"q_{q.id}", "").strip()
+            tkey = f"t_{q.id}"
+            time_taken = float(request.form.get(tkey) or 0.0)
+            correct_flag = 0
+            if q.qtype == "mcq":
+                correct_flag = 1 if ans.strip().lower() == (q.correct or "").strip().lower() else 0
+            else:
+                sim = subjective_similarity(ans or "", q.correct or "")
+                correct_flag = 1 if sim >= 0.6 else 0
+            if not practice:
+                a = Attempt(student_id=student.id, quiz_id=quiz_id, passage_id=(passage.id if passage else None),
+                            question_id=q.id, student_answer=ans, correct=int(correct_flag),
+                            time_taken=time_taken, created_at=now)
+                db.session.add(a)
+        db.session.commit()
+        # progress
+        # determine next index
+        if quiz.is_passage_based:
+            next_index = p_index + 1
+            if next_index >= len(Passage.query.filter_by(quiz_id=quiz_id).all()):
+                return redirect(url_for("quiz_complete", quiz_id=quiz_id))
+            else:
+                # after timed submission, allow practice mode for same page if practice parameter present
+                if request.form.get("practice","") == "1":
+                    return render_template_string(BASE_HTML, content="<div class='card'><p class='muted'>Practice answers recorded (not graded). Continue to next passage.</p><a class='btn' href='{}'>Next Passage</a></div>".format(url_for("quiz_passage", quiz_id=quiz_id, p_index=next_index)))
+                return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=next_index))
+        else:
+            # regular pages
+            # compute number of pages
+            all_questions = Question.query.filter_by(quiz_id=quiz_id).order_by(Question.id).all()
+            page_size = 5
+            pages = [all_questions[i:i+page_size] for i in range(0, len(all_questions), page_size)] if all_questions else [[]]
+            next_index = p_index + 1
+            if next_index >= len(pages):
+                return redirect(url_for("quiz_complete", quiz_id=quiz_id))
+            else:
+                if request.form.get("practice","") == "1":
+                    return render_template_string(BASE_HTML, content="<div class='card'><p class='muted'>Practice mode — answers not graded. Continue.</p><a class='btn' href='{}'>Next</a></div>".format(url_for("quiz_passage", quiz_id=quiz_id, p_index=next_index)))
+                return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=next_index))
+    # GET: render page with JS for timer and anti-cheat
+    total_pages = (len(Passage.query.filter_by(quiz_id=quiz_id).all()) if quiz.is_passage_based else max(1, ((len(Question.query.filter_by(quiz_id=quiz_id).all())+4)//5)))
+    progress_pct = int((p_index/ max(1, total_pages)) * 100)
+    # inline JS: timer, warning, fullscreen & visibility detection
+    timer_seconds = quiz.timer_seconds or 0
+    # warning threshold: 60s or 10% whichever smaller? Use 60s default
+    warning_seconds = 60 if timer_seconds>=60 else max(5, int(timer_seconds*0.1))
+    # Build questions HTML
+    q_html = "<form method='post' id='quizForm'>"
+    for q in display_questions:
+        q_html += "<div style='margin-top:12px;padding:10px;border-radius:8px;border:1px solid #eef2ff'>"
+        q_html += f"<p><b>{q.text}</b> <span class='muted small'>({q.difficulty})</span></p>"
+        if q.qtype == "mcq":
+            for opt in ("option_a","option_b","option_c","option_d"):
+                val = getattr(q,opt)
+                if val:
+                    q_html += f"<div><label><input type='radio' name='q_{q.id}' value='{val}'> {val}</label></div>"
+        else:
+            q_html += f"<textarea name='q_{q.id}' rows='3' placeholder='Type your answer...' style='width:100%'></textarea>"
+        q_html += f"<input type='hidden' name='t_{q.id}' value='0'>"
+        q_html += "</div>"
+    # submission buttons: normal + practice
+    q_html += "<div style='margin-top:12px;display:flex;gap:8px'><button class='btn' type='submit'>Submit</button><button class='btn alt' type='button' onclick=\"document.getElementById('practiceFlag').value='1';document.getElementById('quizForm').submit();\">Practice Mode</button></div>"
+    q_html += "<input type='hidden' id='practiceFlag' name='practice' value='0'></form>"
+    # page HTML
+    passage_title = (passage.title if passage else ("Page %d" % (p_index+1)))
+    passage_content = (passage.content if passage else "")
+    time_lock_js = ""
+    if timer_seconds and timer_seconds>0:
+        time_lock_js = f"""
+<script>
+let timeLeft = {timer_seconds};
+let warningAt = {warning_seconds};
+let warned = false;
+let violations = 0;
+const maxViolations = 3; // after 3 visibility violations auto-submit
+function updateTimer() {{
+    let mm = Math.floor(timeLeft/60);
+    let ss = timeLeft%60;
+    document.getElementById('timer').innerText = mm + ':' + (ss<10? '0'+ss : ss);
+    if(timeLeft==warningAt && !warned) {{
+        warned = true;
+        alert('⚠️ Only ' + warningAt + ' seconds remaining!');
+    }}
+    if(timeLeft<=0) {{
+        clearInterval(ti);
+        alert('⏰ Time is up — your answers will be auto-submitted. You may then continue in practice mode.');
+        // set practice=0 and submit
+        document.getElementById('practiceFlag').value='0';
+        document.getElementById('quizForm').submit();
+    }}
+    timeLeft -= 1;
+}}
+let ti = setInterval(updateTimer, 1000);
+document.addEventListener('visibilitychange', function() {{
+    if(document.hidden) {{
+        violations += 1;
+        alert('🚨 Warning: you left the quiz tab/window. Violation ' + violations + '. Stay focused on the quiz!');
+        if(violations >= maxViolations) {{
+            alert('Too many violations — auto-submitting answers now.');
+            document.getElementById('quizForm').submit();
+        }}
+    }}
+}});
+// Request fullscreen on page load for exam-like environment
+function goFull() {{
+  const el = document.documentElement;
+  if(el.requestFullscreen) el.requestFullscreen();
+  else if(el.mozRequestFullScreen) el.mozRequestFullScreen();
+  else if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+  else if(el.msRequestFullscreen) el.msRequestFullscreen();
+}}
+window.onload = function(){{
+  try {{ goFull(); }} catch(e){{ console.log(e); }}
+  updateTimer();
+}};
+</script>
+"""
+    # combine content
+    content = f"""
+    <div class='card'><h3>{quiz.title}</h3><div class='muted'>{quiz.subject} • Grade {quiz.grade} • {'Passage-based' if quiz.is_passage_based else 'Regular'}</div></div>
+    <div class='card'>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <div><h4>{passage_title}</h4></div>
+        <div><span id='timer' class='tag'>{timer_seconds>0 and (str(timer_seconds//60)+':'+str(timer_seconds%60).zfill(2)) or 'No timer'}</span></div>
+      </div>
+      <div class='muted' style='white-space:pre-wrap;margin-top:8px'>{passage_content}</div>
+      <div class='progress'><div style='width:{progress_pct}%;'></div></div>
+      <div style='margin-top:12px'>{q_html}</div>
+    </div>
+    {time_lock_js}
+    """
+    return render_template_string(BASE_HTML, content=content)
+
+# convenience route to map start -> passage 0
+@app.route("/quiz/<int:quiz_id>/start")
+def qstart(quiz_id):
+    return redirect(url_for("quiz_passage", quiz_id=quiz_id, p_index=0))
+
+# ---------- Quiz complete ----------
+@app.route("/quiz/<int:quiz_id>/complete")
+def quiz_complete(quiz_id):
+    if "student_id" not in session:
+        return redirect(url_for("login"))
+    sid = session["student_id"]
+    total = db.session.query(db.func.count(Attempt.id)).filter_by(student_id=sid, quiz_id=quiz_id).scalar() or 0
+    correct = db.session.query(db.func.sum(Attempt.correct)).filter_by(student_id=sid, quiz_id=quiz_id).scalar() or 0
+    pct = round((correct/total)*100,2) if total>0 else 0.0
+    content = f"<div class='card'><h3>Quiz Complete</h3><p class='muted'>You answered {correct} of {total} correctly.</p><h4>Score: {pct}%</h4><a class='btn' href='/student/dashboard'>Back to Dashboard</a></div>"
+    return render_template_string(BASE_HTML, content=content)
 
 # ---------- Teacher Dashboard ----------
 @app.route("/teacher/dashboard")
 def teacher_dashboard():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
-
-    total_students = User.query.filter_by(role="student").count()
-    total_quizzes = Quiz.query.count()
-    total_attempts = Attempt.query.count()
-
-    # student stats
-    rows = db.session.query(
-        User.username, User.name, User.grade, User.class_section, User.gender, User.level,
-        db.func.count(Attempt.id).label("attempts"),
-        db.func.sum(Attempt.correct).label("correct")
-    ).outerjoin(Attempt, Attempt.user_id==User.id).group_by(User.id).filter(User.role=="student").all()
-
-    # simple tables for quizzes, passages, questions
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    # Aggregates: grade-level, class-level, gender, difficulty success rates, level distribution, time vs score
+    # Grade performance
+    grade_rows = db.session.query(Student.grade, db.func.sum(Attempt.correct).label("correct"), db.func.count(Attempt.id).label("total")).join(Attempt, Attempt.student_id==Student.id).group_by(Student.grade).all()
+    grades = [r[0] or "N/A" for r in grade_rows]
+    grade_pcts = [ round((r[1] or 0)/ (r[2] or 1) * 100,2) for r in grade_rows ]
+    # Class performance
+    class_rows = db.session.query(Student.class_section, db.func.sum(Attempt.correct).label("correct"), db.func.count(Attempt.id).label("total")).join(Attempt, Attempt.student_id==Student.id).group_by(Student.class_section).all()
+    classes = [r[0] or "N/A" for r in class_rows]
+    class_pcts = [ round((r[1] or 0)/ (r[2] or 1) * 100,2) for r in class_rows ]
+    # Gender breakdown
+    gender_rows = db.session.query(Student.gender, db.func.sum(Attempt.correct).label("correct"), db.func.count(Attempt.id).label("total")).join(Attempt, Attempt.student_id==Student.id).group_by(Student.gender).all()
+    genders = [r[0] or "N/A" for r in gender_rows]
+    gender_pcts = [ round((r[1] or 0)/ (r[2] or 1) * 100,2) for r in gender_rows ]
+    # Difficulty success
+    diff_rows = db.session.query(Question.difficulty, db.func.sum(Attempt.correct).label("correct"), db.func.count(Attempt.id).label("total")).join(Attempt, Attempt.question_id==Question.id).group_by(Question.difficulty).all()
+    diffs = [r[0] or "N/A" for r in diff_rows]
+    diff_pcts = [ round((r[1] or 0)/ (r[2] or 1) * 100,2) for r in diff_rows ]
+    # Level distribution
+    level_rows = db.session.query(Student.level, db.func.count(Student.id)).group_by(Student.level).all()
+    level_labels = [r[0] or "N/A" for r in level_rows]
+    level_counts = [r[1] for r in level_rows]
+    # Time vs score per student
+    ts_rows = db.session.query(Student.user_id, db.func.avg(Attempt.time_taken).label("avg_time"), (db.func.sum(Attempt.correct)*100.0/db.func.count(Attempt.id)).label("pct")).join(Attempt, Attempt.student_id==Student.id).group_by(Student.user_id).all()
+    # server-side charts via matplotlib -> base64 images
+    plots_html = ""
+    # grade plot
+    if grades:
+        fig, ax = plt.subplots(figsize=(5,2.5))
+        ax.bar(grades, grade_pcts, color=['#7c3aed','#0b6cf1','#06b6d4','#f97316'][:len(grades)])
+        ax.set_ylim(0,100); ax.set_title("Performance by Grade (%)"); ax.set_ylabel("Avg %")
+        plots_html += f"<div class='card'><img src='data:image/png;base64,{make_plot_base64(fig)}' style='max-width:100%'/></div>"
+    # class plot
+    if classes:
+        fig, ax = plt.subplots(figsize=(5,2.5))
+        ax.bar(classes, class_pcts)
+        ax.set_ylim(0,100); ax.set_title("Performance by Class (%)")
+        plots_html += f"<div class='card'>{''}<img src='data:image/png;base64,{make_plot_base64(fig)}' style='max-width:100%'/></div>"
+    # difficulty pie
+    if diffs:
+        fig, ax = plt.subplots(figsize=(4,3))
+        ax.pie(diff_pcts, labels=diffs, autopct='%1.1f%%'); ax.set_title("Difficulty Success (%)")
+        plots_html += f"<div class='card'><img src='data:image/png;base64,{make_plot_base64(fig)}' style='max-width:100%'/></div>"
+    # level distribution
+    if level_labels:
+        fig, ax = plt.subplots(figsize=(4,3))
+        ax.pie(level_counts, labels=level_labels, autopct='%1.1f%%'); ax.set_title("Level Distribution")
+        plots_html += f"<div class='card'><img src='data:image/png;base64,{make_plot_base64(fig)}' style='max-width:100%'/></div>"
+    # Time vs score table
+    ts_html = "<table style='width:100%;border-collapse:collapse'><tr><th style='text-align:left'>User</th><th>Avg time (s)</th><th>Score %</th></tr>"
+    for r in ts_rows:
+        ts_html += f"<tr><td style='padding:6px;border-bottom:1px solid #f1f5f9'>{r[0]}</td><td style='padding:6px;border-bottom:1px solid #f1f5f9'>{round(r[1] or 0,2)}</td><td style='padding:6px;border-bottom:1px solid #f1f5f9'>{round(r[2] or 0,2)}</td></tr>"
+    ts_html += "</table>"
+    # quizzes list
     quizzes = Quiz.query.order_by(Quiz.created_at.desc()).all()
-
-    html = f"<div class='card p-3'><h4>Teacher Dashboard</h4><div class='muted'>Overview</div><div class='mt-2'>Students: <b>{total_students}</b> • Quizzes: <b>{total_quizzes}</b> • Attempts: <b>{total_attempts}</b></div></div>"
-    html += "<div class='card p-3 mt-3'><h5>Students</h5>"
-    if not rows:
-        html += "<p class='muted'>No students yet</p>"
-    else:
-        html += "<table class='table table-sm'><thead><tr><th>User</th><th>Name</th><th>Grade</th><th>Class</th><th>Level</th><th>Attempts</th><th>Correct</th></tr></thead><tbody>"
-        for r in rows:
-            html += f"<tr><td>{r[0]}</td><td>{r[1] or ''}</td><td>{r[2] or ''}</td><td>{r[3] or ''}</td><td>{r[5] or ''}</td><td>{int(r[6] or 0)}</td><td>{int(r[7] or 0)}</td></tr>"
-        html += "</tbody></table>"
-    html += "</div>"
-
-    html += "<div class='card p-3 mt-3'><h5>Quizzes</h5>"
-    html += "<a class='btn btn-primary' href='/teacher/create_quiz'>Create New Quiz</a>"
-    if not quizzes:
-        html += "<p class='muted mt-2'>No quizzes</p>"
-    else:
-        html += "<table class='table table-sm mt-2'><thead><tr><th>Title</th><th>Subject</th><th>Grade</th><th>Created</th><th>Actions</th></tr></thead><tbody>"
-        for q in quizzes:
-            html += f"<tr><td>{q.title}</td><td>{q.subject or ''}</td><td>{q.grade or ''}</td><td>{q.created_at.strftime('%Y-%m-%d')}</td><td><a class='btn btn-sm btn-outline-primary' href='/teacher/add_passage/{q.id}'>Add Passage</a> <a class='btn btn-sm btn-outline-secondary' href='/teacher/view_quiz/{q.id}'>View</a> <a class='btn btn-sm btn-danger' href='/teacher/delete_quiz/{q.id}'>Delete</a></td></tr>"
-        html += "</tbody></table>"
-    html += "</div>"
-
-    html += "<div class='card p-3 mt-3'><a class='btn btn-outline-primary' href='/teacher/export_pdf'>Export Students PDF</a> <a class='btn btn-danger ms-2' href='/teacher/reset_confirm'>Reset DB</a></div>"
-
-    return render_template_string(BASE, content=html)
+    qlist_html = ""
+    for q in quizzes:
+        qlist_html += f"<div style='padding:8px;border-bottom:1px solid #f1f5f9'><b>{q.title}</b> <div class='muted small'>{q.subject} • Grade {q.grade} • {'Passage' if q.is_passage_based else 'Regular'} • Placement:{'Yes' if q.is_placement else 'No'}</div><div style='margin-top:6px'><a class='btn alt' href='/teacher/view_quiz/{q.id}'>View</a> <a class='btn' href='/teacher/delete_quiz/{q.id}'>Delete</a></div></div>"
+    content = f"""
+    <div class='card'><h2>Teacher Dashboard</h2><div class='muted'>Comprehensive analytics</div></div>
+    <div class='row'>
+      <div class='col card'><h3>Quizzes</h3><a class='btn' href='/teacher/create_quiz'>Create Quiz</a> <a class='btn alt' href='/teacher/export_pdf'>Export PDF</a> <a class='btn' href='/teacher/reset_confirm' style='background:#ef4444'>Reset DB</a><div style='margin-top:12px'>{qlist_html}</div></div>
+      <div class='col card'><h3>Analytics</h3>{plots_html}<div style='margin-top:12px'>{ts_html}</div></div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, content=content)
 
 # ---------- Teacher: create quiz ----------
 @app.route("/teacher/create_quiz", methods=["GET","POST"])
 def teacher_create_quiz():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
+    if "teacher" not in session:
+        return redirect(url_for("login"))
     if request.method == "POST":
         title = request.form.get("title","").strip()
         grade = request.form.get("grade","").strip()
         subject = request.form.get("subject","").strip()
-        timer_seconds = int(request.form.get("timer_seconds") or 0)
-        q = Quiz(title=title, grade=grade, subject=subject, timer_seconds=timer_seconds)
+        is_passage_based = 1 if request.form.get("is_passage_based")=="1" else 0
+        is_placement = 1 if request.form.get("is_placement")=="1" else 0
+        use_level = 1 if request.form.get("use_level_filter")=="1" else 0
+        timer = int(request.form.get("timer_seconds") or 0)
+        q = Quiz(title=title, grade=grade, subject=subject, is_passage_based=is_passage_based, is_placement=is_placement, use_level_filter=use_level, timer_seconds=timer)
         db.session.add(q); db.session.commit()
-        return redirect(f"/teacher/add_passage/{q.id}")
-    html = "<div class='card p-3'><h5>Create Quiz</h5><form method='post'><input class='form-control mb-2' name='title' placeholder='Title' required><input class='form-control mb-2' name='grade' placeholder='Grade'><input class='form-control mb-2' name='subject' placeholder='Subject'><input class='form-control mb-2' name='timer_seconds' placeholder='Timer seconds per passage'><button class='btn btn-primary' type='submit'>Create</button></form></div>"
-    return render_template_string(BASE, content=html)
+        return redirect(url_for("teacher_add_passage", quiz_id=q.id) if is_passage_based else url_for("teacher_add_regular_questions", quiz_id=q.id))
+    content = """
+    <div class='card' style='max-width:760px;margin:auto'><h3>Create Quiz</h3>
+    <form method='post'>
+      <input name='title' placeholder='Title' class='form-control' required>
+      <div style='display:flex;gap:8px'><input name='grade' placeholder='Grade' class='form-control'><input name='subject' placeholder='Subject' class='form-control'></div>
+      <div style='display:flex;gap:8px;margin-top:8px'><label><input type='checkbox' name='is_passage_based' value='1'> Passage-based</label><label><input type='checkbox' name='is_placement' value='1'> Placement test</label><label><input type='checkbox' name='use_level_filter' value='1'> Use level filter</label></div>
+      <input name='timer_seconds' placeholder='Timer seconds per page (optional)' class='form-control'>
+      <button class='btn' type='submit'>Create Quiz</button>
+    </form></div>
+    """
+    return render_template_string(BASE_HTML, content=content)
 
 # ---------- Teacher: add passage ----------
 @app.route("/teacher/add_passage/<int:quiz_id>", methods=["GET","POST"])
 def teacher_add_passage(quiz_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
+    if "teacher" not in session:
+        return redirect(url_for("login"))
     quiz = Quiz.query.get(quiz_id)
     if not quiz:
-        return render_template_string(BASE, content="<div class='card p-3'>Quiz not found</div>")
+        return render_template_string(BASE_HTML, content="<div class='card'>Quiz not found</div>")
     if request.method == "POST":
         title = request.form.get("title","").strip()
         content = request.form.get("content","").strip()
-        difficulty = request.form.get("difficulty","medium")
-        p = Passage(quiz_id=quiz_id, title=title, content=content, difficulty=difficulty)
+        p = Passage(quiz_id=quiz_id, title=title, content=content)
         db.session.add(p); db.session.commit()
-        return redirect(f"/teacher/add_question/{p.id}")
-    html = f"<div class='card p-3'><h5>Add Passage to {quiz.title}</h5><form method='post'><input class='form-control mb-2' name='title' placeholder='Passage title'><select class='form-select mb-2' name='difficulty'><option value='easy'>easy</option><option selected value='medium'>medium</option><option value='hard'>hard</option></select><textarea class='form-control mb-2' name='content' rows='6' placeholder='Passage text'></textarea><button class='btn btn-primary' type='submit'>Add Passage</button></form></div>"
-    return render_template_string(BASE, content=html)
+        return redirect(url_for("teacher_add_question", passage_id=p.id))
+    content = f"""
+    <div class='card'><h3>Add Passage to {quiz.title}</h3>
+    <form method='post'>
+      <input name='title' placeholder='Passage title' class='form-control'>
+      <textarea name='content' rows='6' placeholder='Passage content' class='form-control'></textarea>
+      <button class='btn' type='submit'>Add Passage & Add Questions</button>
+    </form></div>
+    """
+    return render_template_string(BASE_HTML, content=content)
 
-# ---------- Teacher: add question (option to attach to passage or leave standalone) ----------
+# ---------- Teacher: add question to passage ----------
 @app.route("/teacher/add_question/<int:passage_id>", methods=["GET","POST"])
 def teacher_add_question(passage_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
-
-    passage = Passage.query.get(passage_id)
-    if not passage:
-        return render_template_string(BASE, content="<div class='card p-3'>Passage not found</div>")
-
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    p = Passage.query.get(passage_id)
+    if not p:
+        return render_template_string(BASE_HTML, content="<div class='card'>Passage not found</div>")
     if request.method == "POST":
         text = request.form.get("text","").strip()
-        qtype = request.form.get("qtype","Understanding")
-        option_a = request.form.get("option_a") or None
-        option_b = request.form.get("option_b") or None
-        option_c = request.form.get("option_c") or None
-        option_d = request.form.get("option_d") or None
+        qtype = request.form.get("qtype","mcq")
+        a = request.form.get("option_a") or None
+        b = request.form.get("option_b") or None
+        c = request.form.get("option_c") or None
+        d = request.form.get("option_d") or None
         correct = request.form.get("correct","").strip()
         difficulty = request.form.get("difficulty","medium")
-        is_cal = 1 if request.form.get("is_calibration") == "on" else 0
-        attach_to_passage = request.form.get("attach_to_passage","on") == "on"  # default attach
-        q = Question(
-            quiz_id = passage.quiz_id if attach_to_passage else None,
-            passage_id = passage.id if attach_to_passage else None,
-            text = text,
-            qtype = qtype,
-            option_a = option_a,
-            option_b = option_b,
-            option_c = option_c,
-            option_d = option_d,
-            correct = correct,
-            difficulty = difficulty,
-            is_calibration = is_cal
-        )
+        q = Question(quiz_id=p.quiz_id, passage_id=passage_id, text=text, qtype=qtype, option_a=a, option_b=b, option_c=c, option_d=d, correct=correct, difficulty=difficulty)
         db.session.add(q); db.session.commit()
-        return render_template_string(BASE, content=f"<div class='card p-3'>Question added. <a class='btn btn-primary' href='/teacher/add_question/{passage_id}'>Add another</a> <a class='btn btn-outline-secondary' href='/teacher/dashboard'>Dashboard</a></div>")
+        return render_template_string(BASE_HTML, content=f"<div class='card'>Question added. <a class='btn' href='/teacher/add_question/{passage_id}'>Add another</a> <a class='btn alt' href='/teacher/dashboard'>Dashboard</a></div>")
+    content = f"""
+    <div class='card'><h3>Add Question to passage: {p.title}</h3>
+    <form method='post'>
+      <textarea name='text' rows='3' placeholder='Question text' class='form-control'></textarea>
+      <select name='qtype' class='form-control'><option value='mcq'>MCQ</option><option value='subjective'>Subjective</option></select>
+      <input name='correct' placeholder='Correct answer / keywords' class='form-control'>
+      <div style='display:flex;gap:8px'><input name='option_a' placeholder='Option A' class='form-control'><input name='option_b' placeholder='Option B' class='form-control'></div>
+      <div style='display:flex;gap:8px'><input name='option_c' placeholder='Option C' class='form-control'><input name='option_d' placeholder='Option D' class='form-control'></div>
+      <select name='difficulty' class='form-control'><option>easy</option><option selected>medium</option><option>hard</option></select>
+      <button class='btn' type='submit'>Add Question</button>
+    </form></div>
+    """
+    return render_template_string(BASE_HTML, content=content)
 
-    html = f"<div class='card p-3'><h5>Add Question (Passage: {passage.title or ''})</h5><form method='post'>"
-    html += "<textarea class='form-control mb-2' name='text' rows='3' placeholder='Question text'></textarea>"
-    html += "<select class='form-select mb-2' name='qtype'><option>Understanding</option><option>Application</option><option>Thinking</option></select>"
-    html += "<input class='form-control mb-2' name='correct' placeholder='Correct answer (A/B/C/D or keywords)'>"
-    html += "<input class='form-control mb-2' name='option_a' placeholder='Option A'><input class='form-control mb-2' name='option_b' placeholder='Option B'>"
-    html += "<input class='form-control mb-2' name='option_c' placeholder='Option C'><input class='form-control mb-2' name='option_d' placeholder='Option D'>"
-    html += "<select class='form-select mb-2' name='difficulty'><option>easy</option><option selected>medium</option><option>hard</option></select>"
-    html += "<div class='form-check mb-2'><input class='form-check-input' type='checkbox' id='is_cal' name='is_calibration'><label class='form-check-label' for='is_cal'>Use as calibration (placement) question</label></div>"
-    html += "<div class='form-check mb-2'><input class='form-check-input' type='checkbox' id='attach_to_passage' name='attach_to_passage' checked><label class='form-check-label' for='attach_to_passage'>Attach this question to the passage</label></div>"
-    html += "<button class='btn btn-primary' type='submit'>Add Question</button></form></div>"
-    return render_template_string(BASE, content=html)
-
-# ---------- Teacher: view quiz details (passages & standalone questions) ----------
-@app.route("/teacher/view_quiz/<int:quiz_id>")
-def teacher_view_quiz(quiz_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
+# ---------- Teacher: add regular (non-passage) questions to quiz ----------
+@app.route("/teacher/add_regular/<int:quiz_id>", methods=["GET","POST"])
+def teacher_add_regular_questions(quiz_id):
+    if "teacher" not in session:
+        return redirect(url_for("login"))
     quiz = Quiz.query.get(quiz_id)
     if not quiz:
-        return render_template_string(BASE, content="<div class='card p-3'>Quiz not found</div>")
-    passages = Passage.query.filter_by(quiz_id=quiz.id).all()
-    standalone_questions = Question.query.filter_by(quiz_id=None, passage_id=None).all()
-    html = f"<div class='card p-3'><h4>{quiz.title}</h4><div class='muted'>Subject: {quiz.subject or ''}</div></div>"
-    html += "<div class='card p-3 mt-3'><h5>Passages</h5>"
-    if not passages:
-        html += "<p class='muted'>No passages</p>"
-    else:
+        return render_template_string(BASE_HTML, content="<div class='card'>Quiz not found</div>")
+    if request.method == "POST":
+        text = request.form.get("text","").strip()
+        qtype = request.form.get("qtype","mcq")
+        a = request.form.get("option_a") or None
+        b = request.form.get("option_b") or None
+        c = request.form.get("option_c") or None
+        d = request.form.get("option_d") or None
+        correct = request.form.get("correct","").strip()
+        difficulty = request.form.get("difficulty","medium")
+        q = Question(quiz_id=quiz_id, passage_id=None, text=text, qtype=qtype, option_a=a, option_b=b, option_c=c, option_d=d, correct=correct, difficulty=difficulty)
+        db.session.add(q); db.session.commit()
+        return render_template_string(BASE_HTML, content=f"<div class='card'>Question added. <a class='btn' href='/teacher/add_regular/{quiz_id}'>Add another</a> <a class='btn alt' href='/teacher/dashboard'>Dashboard</a></div>")
+    content = f"""
+    <div class='card'><h3>Add Regular Question to {quiz.title}</h3>
+    <form method='post'>
+      <textarea name='text' rows='3' placeholder='Question text' class='form-control'></textarea>
+      <select name='qtype' class='form-control'><option value='mcq'>MCQ</option><option value='subjective'>Subjective</option></select>
+      <input name='correct' placeholder='Correct answer/keywords' class='form-control'>
+      <div style='display:flex;gap:8px'><input name='option_a' placeholder='Option A' class='form-control'><input name='option_b' placeholder='Option B' class='form-control'></div>
+      <div style='display:flex;gap:8px'><input name='option_c' placeholder='Option C' class='form-control'><input name='option_d' placeholder='Option D' class='form-control'></div>
+      <select name='difficulty' class='form-control'><option>easy</option><option selected>medium</option><option>hard</option></select>
+      <button class='btn' type='submit'>Add Question</button>
+    </form></div>
+    """
+    return render_template_string(BASE_HTML, content=content)
+
+# ---------- Teacher: view quiz ----------
+@app.route("/teacher/view_quiz/<int:quiz_id>")
+def teacher_view_quiz(quiz_id):
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    quiz = Quiz.query.get(quiz_id)
+    if not quiz:
+        return render_template_string(BASE_HTML, content="<div class='card'>Quiz not found</div>")
+    passages = Passage.query.filter_by(quiz_id=quiz_id).all() if quiz.is_passage_based else []
+    questions = Question.query.filter_by(quiz_id=quiz_id, passage_id=None).all() if not quiz.is_passage_based else []
+    html = f"<div class='card'><h3>{quiz.title}</h3><div class='muted'>{quiz.subject} • Grade {quiz.grade} • {'Passage' if quiz.is_passage_based else 'Regular'}</div></div>"
+    if quiz.is_passage_based:
         for p in passages:
-            html += f"<div style='border-bottom:1px solid #eef2ff;padding:8px 0'><h6>{p.title} <small class='muted'>({p.difficulty})</small></h6><div style='white-space:pre-wrap'>{p.content}</div>"
+            html += f"<div class='card'><h4>Passage: {p.title}</h4><div class='muted' style='white-space:pre-wrap'>{p.content}</div><a class='btn' href='/teacher/add_question/{p.id}'>Add question</a>"
             qs = Question.query.filter_by(passage_id=p.id).all()
-            if qs:
-                html += "<ul>"
-                for q in qs:
-                    html += f"<li>{q.text} <small class='muted'>({q.difficulty})</small></li>"
-                html += "</ul>"
-            html += f"<a class='btn btn-sm btn-outline-primary' href='/teacher/add_question/{p.id}'>Add Question</a></div>"
-    html += "</div>"
-
-    html += "<div class='card p-3 mt-3'><h5>Standalone Questions</h5>"
-    if not standalone_questions:
-        html += "<p class='muted'>No standalone questions</p>"
+            for q in qs:
+                html += f"<div style='padding:6px;border-bottom:1px solid #f1f5f9'>{q.text}<div class='muted small'>Type:{q.qtype} • Correct:{q.correct}</div></div>"
+            html += "</div>"
     else:
-        html += "<ul>"
-        for q in standalone_questions:
-            html += f"<li>{q.text} <small class='muted'>({q.difficulty})</small></li>"
-        html += "</ul>"
-    html += "</div>"
-    return render_template_string(BASE, content=html)
+        for q in questions:
+            html += f"<div class='card'><b>{q.text}</b><div class='muted small'>Type:{q.qtype} • Correct:{q.correct}</div></div>"
+    html += "<a class='btn' href='/teacher/dashboard'>Back</a>"
+    return render_template_string(BASE_HTML, content=html)
 
-# ---------- Export PDF (teacher) ----------
+# ---------- Teacher: delete quiz ----------
+@app.route("/teacher/delete_quiz/<int:quiz_id>", methods=["GET","POST"])
+def teacher_delete_quiz(quiz_id):
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    quiz = Quiz.query.get(quiz_id)
+    if not quiz:
+        return render_template_string(BASE_HTML, content="<div class='card'>Quiz not found</div>")
+    if request.method == "POST":
+        Attempt.query.filter_by(quiz_id=quiz_id).delete()
+        Question.query.filter(Question.passage_id.in_([p.id for p in Passage.query.filter_by(quiz_id=quiz_id)])).delete()
+        Passage.query.filter_by(quiz_id=quiz_id).delete()
+        Question.query.filter_by(quiz_id=quiz_id, passage_id=None).delete()
+        db.session.delete(quiz); db.session.commit()
+        return redirect(url_for("teacher_dashboard"))
+    return render_template_string(BASE_HTML, content=f"<div class='card'><h3>Confirm Delete Quiz: {quiz.title}</h3><form method='post'><button class='btn' type='submit' style='background:#ef4444'>Delete</button> <a class='btn alt' href='/teacher/dashboard'>Cancel</a></form></div>")
+
+# ---------- Teacher: export PDF ----------
 @app.route("/teacher/export_pdf")
 def teacher_export_pdf():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
-
-    rows = db.session.query(User.username, User.name, User.grade, User.class_section, User.gender, User.role, User.level,
-                            db.func.count(Attempt.id).label("attempts"), db.func.sum(Attempt.correct).label("correct")) \
-            .outerjoin(Attempt, Attempt.user_id==User.id).group_by(User.id).order_by(User.grade, User.class_section).all()
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    rows = db.session.query(Student.user_id, Student.name, Student.grade, Student.class_section, Student.gender, Student.level, db.func.count(Attempt.id).label("attempts"), db.func.sum(Attempt.correct).label("correct")).outerjoin(Attempt, Attempt.student_id==Student.id).group_by(Student.id).order_by(Student.grade, Student.class_section).all()
     data = []
     for r in rows:
-        data.append({"username": r[0], "name": r[1], "grade": r[2], "class": r[3], "gender": r[4], "role": r[5], "level": r[6], "attempts": int(r[7] or 0), "correct": int(r[8] or 0)})
-    pdfb = generate_pdf_bytes(data)
-    return send_file(io.BytesIO(pdfb), download_name="students_report.pdf", as_attachment=True, mimetype="application/pdf")
+        data.append({"user_id": r[0], "name": r[1], "grade": r[2], "class": r[3], "gender": r[4], "level": r[5], "attempts": int(r[6] or 0), "correct": int(r[7] or 0)})
+    pdfb = student_report_pdf_bytes(data)
+    b64 = base64.b64encode(pdfb).decode('ascii')
+    content = f"<div class='card'><h3>Export PDF</h3><p class='muted'>Click to download student report</p><a class='btn' href='data:application/pdf;base64,{b64}' download='students_report.pdf'>Download PDF</a></div>"
+    return render_template_string(BASE_HTML, content=content)
 
-# ---------- Reset DB ----------
+# ---------- Teacher: reset DB ----------
 @app.route("/teacher/reset_confirm")
 def teacher_reset_confirm():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
-    content = "<div class='card p-3'><h5>Reset Database</h5><p class='muted'>This will delete ALL students, quizzes, passages, questions and attempts. Type YES to confirm.</p><form method='post' action='/teacher/reset_db'><input class='form-control mb-2' name='confirm'><button class='btn btn-danger' type='submit'>Reset</button> <a class='btn btn-outline-secondary' href='/teacher/dashboard'>Cancel</a></form></div>"
-    return render_template_string(BASE, content=content)
+    if "teacher" not in session:
+        return redirect(url_for("login"))
+    content = "<div class='card'><h3>Reset Database</h3><p class='muted'>This will permanently delete all students, quizzes, questions, passages, and attempts. Type YES to confirm.</p><form method='post' action='/teacher/reset_db'><input name='confirm' placeholder='Type YES to confirm'><button class='btn' type='submit' style='background:#ef4444'>Reset</button> <a class='btn alt' href='/teacher/dashboard'>Cancel</a></form></div>"
+    return render_template_string(BASE_HTML, content=content)
 
 @app.route("/teacher/reset_db", methods=["POST"])
 def teacher_reset_db():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
+    if "teacher" not in session:
+        return redirect(url_for("login"))
     if request.form.get("confirm") != "YES":
-        return redirect("/teacher/dashboard")
-    db.drop_all()
-    db.create_all()
-    return render_template_string(BASE, content="<div class='card p-3'>Database reset.</div>")
+        return redirect(url_for("teacher_dashboard"))
+    Attempt.query.delete(); Question.query.delete(); Passage.query.delete(); Quiz.query.delete(); Student.query.delete()
+    db.session.commit(); db.create_all()
+    return render_template_string(BASE_HTML, content="<div class='card'><p>Database reset complete.</p><a class='btn' href='/'>Home</a></div>")
 
-# ---------- Delete quiz ----------
-@app.route("/teacher/delete_quiz/<int:quiz_id>", methods=["GET","POST"])
-def teacher_delete_quiz(quiz_id):
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    if user.role != "teacher":
-        return render_template_string(BASE, content="<div class='card p-3'>Access denied</div>")
-    q = Quiz.query.get(quiz_id)
-    if not q:
-        return render_template_string(BASE, content="<div class='card p-3'>Quiz not found</div>")
-    if request.method == "POST":
-        Attempt.query.filter_by(quiz_id=quiz_id).delete()
-        # delete questions associated to passages of this quiz
-        passage_ids = [p.id for p in Passage.query.filter_by(quiz_id=quiz_id).all()]
-        if passage_ids:
-            Question.query.filter(Question.passage_id.in_(passage_ids)).delete(synchronize_session=False)
-        Passage.query.filter_by(quiz_id=quiz_id).delete()
-        db.session.delete(q); db.session.commit()
-        return redirect("/teacher/dashboard")
-    return render_template_string(BASE, content=f"<div class='card p-3'><h5>Delete Quiz: {q.title}</h5><form method='post'><button class='btn btn-danger' type='submit'>Confirm Delete</button> <a class='btn btn-outline-secondary' href='/teacher/dashboard'>Cancel</a></form></div>")
-
-# ---------- Report (student) ----------
-@app.route("/report")
-def report():
-    if "user_id" not in session:
-        return redirect("/login")
-    user = User.query.get(session["user_id"])
-    results = db.session.query(Question.text, Question.correct, Attempt.correct).join(Attempt, Attempt.question_id==Question.id).filter(Attempt.user_id==user.id).all()
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, f"Quiz Report - {user.username}", ln=True, align="C")
-    pdf.ln(10)
-    correct_count = 0
-    for text, ans, corr in results:
-        status = "Correct" if corr else "Wrong"
-        if corr:
-            correct_count += 1
-        pdf.multi_cell(0, 8, f"Q: {text}\nResult: {status}\nAnswer/key: {ans}\n")
-    pdf.ln(5)
-    pdf.cell(200, 10, f"Final Score: {correct_count}/{len(results)}", ln=True, align="C")
-    filename = f"report_{user.username}.pdf"
-    pdf.output(filename)
-    return send_file(filename, as_attachment=True)
-
-# ---------- Seed route ----------
+# ---------- Seed route for dev ----------
 @app.route("/_seed")
 def seed():
-    # quick sample data: one teacher, some students, one quiz, passage & questions
-    if User.query.filter_by(username="teacher1").first() is None:
-        t = User(username="teacher1", password=generate_password_hash("teachpass"), name="Teacher One", role="teacher")
-        db.session.add(t)
-    for i in range(1,5):
-        if User.query.filter_by(username=f"student{i}").first() is None:
-            st = User(username=f"student{i}", password=generate_password_hash("pass123"), name=f"Student {i}", role="student", grade=str(6 + (i%3)), class_section=str((i%2)+1), gender="Male" if i%2==0 else "Female")
-            db.session.add(st)
-    db.session.commit()
-
-    if Quiz.query.filter_by(title="Sample Quiz").first() is None:
-        qz = Quiz(title="Sample Quiz", grade="7", subject="General", timer_seconds=90); db.session.add(qz); db.session.commit()
-        p = Passage(quiz_id=qz.id, title="Sample Passage (Easy)", content="Read: 2+2=4", difficulty="easy"); db.session.add(p); db.session.commit()
+    # Create sample data for quick testing
+    if Student.query.count() == 0:
+        for i in range(1,7):
+            uid = f"stud{i}"
+            if not Student.query.filter_by(user_id=uid).first():
+                st = Student(user_id=uid, password=generate_password_hash("pass123"), name=f"Student {i}", grade=str(6 + (i%3)), class_section=str((i%2)+1), gender="Male" if i%2==0 else "Female")
+                db.session.add(st)
+    if Quiz.query.count() == 0:
+        qz = Quiz(title="Sample Passage Quiz", grade="7", subject="Math", is_passage_based=1, timer_seconds=120)
+        db.session.add(qz); db.session.commit()
+        p = Passage(quiz_id=qz.id, title="Sample Passage", content="Read the passage carefully. Solve the following.")
+        db.session.add(p); db.session.commit()
         qs = [
-            Question(quiz_id=qz.id, passage_id=p.id, text="2+2=?", qtype="Understanding", option_a="3", option_b="4", option_c="5", option_d="6", correct="B", difficulty="easy"),
-            Question(quiz_id=qz.id, passage_id=p.id, text="What is 7*6?", qtype="Understanding", option_a="42", option_b="36", option_c="44", option_d="48", correct="A", difficulty="easy"),
-            Question(quiz_id=qz.id, passage_id=p.id, text="Solve x: 3x+2=11", qtype="Application", correct="3", difficulty="medium"),
-            Question(quiz_id=qz.id, passage_id=p.id, text="Explain a prime number", qtype="Thinking", correct="divisible only by 1 and itself", difficulty="hard", is_calibration=1),
+            Question(quiz_id=qz.id, passage_id=p.id, text="2+2=?", qtype="mcq", option_a="3", option_b="4", option_c="5", option_d="6", correct="4", difficulty="easy"),
+            Question(quiz_id=qz.id, passage_id=p.id, text="5*6=?", qtype="mcq", option_a="30", option_b="26", option_c="56", option_d="40", correct="30", difficulty="easy"),
+            Question(quiz_id=qz.id, passage_id=p.id, text="Solve x: 3x+2=11", qtype="subjective", correct="3", difficulty="medium"),
+            Question(quiz_id=qz.id, passage_id=p.id, text="Explain prime numbers", qtype="subjective", correct="divisible only by 1 and itself", difficulty="hard"),
         ]
-        for qu in qs:
-            db.session.add(qu)
-        db.session.commit()
+        for q in qs:
+            db.session.add(q)
+    if Quiz.query.filter_by(title="Regular Quiz").first() is None:
+        qz2 = Quiz(title="Regular Quiz", grade="8", subject="Science", is_passage_based=0, timer_seconds=90)
+        db.session.add(qz2); db.session.commit()
+        qreg = Question(quiz_id=qz2.id, passage_id=None, text="What is H2O?", qtype="mcq", option_a="Water", option_b="Oxygen", option_c="Hydrogen", option_d="Helium", correct="Water", difficulty="easy")
+        db.session.add(qreg)
+    db.session.commit()
     return "Seeded sample data"
 
-# ------------- Startup -------------
+# ---------------- Run ----------------
 if __name__ == "__main__":
-    # ensure DB exists
-    with app.app_context():
-        db.create_all()
     print("Starting Ambassador Quiz App on http://127.0.0.1:5000")
     app.run(host="0.0.0.0", port=5000, debug=True)
